@@ -26,6 +26,9 @@ MODEL_REGISTRY = [
     ModelConfig("Llama-3.1-8B",  "meta-llama/Meta-Llama-3.1-8B-Instruct",        8.0,  True),
 ]
 
+MODEL_NAMES = [m.name for m in MODEL_REGISTRY]
+MODEL_SIZES = {m.name: m.size_b for m in MODEL_REGISTRY}
+
 
 def get_model_by_name(name: str) -> ModelConfig:
     for m in MODEL_REGISTRY:

@@ -13,6 +13,10 @@ import numpy as np
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 
+# ---------------------------------------------------------------------------
+# Chat formatting
+# ---------------------------------------------------------------------------
+
 def format_messages(messages: list[dict], tokenizer: PreTrainedTokenizerBase) -> str:
     try:
         return tokenizer.apply_chat_template(
@@ -21,6 +25,10 @@ def format_messages(messages: list[dict], tokenizer: PreTrainedTokenizerBase) ->
     except Exception:
         return "\n".join(f"{m['role'].upper()}: {m['content']}" for m in messages) + "\nASSISTANT:"
 
+
+# ---------------------------------------------------------------------------
+# Batched generation (accuracy + consistency steps)
+# ---------------------------------------------------------------------------
 
 def generate_responses(
     model: PreTrainedModel,
@@ -58,6 +66,10 @@ def generate_responses(
 
     return all_responses
 
+
+# ---------------------------------------------------------------------------
+# Single-item generation with logit features (calibration step)
+# ---------------------------------------------------------------------------
 
 def generate_with_entropy(
     model: PreTrainedModel,
@@ -117,6 +129,10 @@ def generate_with_entropy(
         "margin_top1_top2":    margin,
     }
 
+
+# ---------------------------------------------------------------------------
+# Answer parsers
+# ---------------------------------------------------------------------------
 
 def normalize_answer(s: str) -> str:
     import string

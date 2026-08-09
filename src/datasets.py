@@ -69,7 +69,7 @@ def load_truthfulqa(n: int = 200, seed: int = 42) -> list[dict]:
         row     = ds[i]
         choices = row["mc1_targets"]["choices"]
         labels  = row["mc1_targets"]["labels"]
-        correct_idx = labels.index(1)
+        # Shuffle choices so correct isn't always first
         paired  = list(zip(choices, labels))
         random.shuffle(paired)
         shuffled_choices, shuffled_labels = zip(*paired)
@@ -84,6 +84,19 @@ def load_truthfulqa(n: int = 200, seed: int = 42) -> list[dict]:
     return samples
 
 
+def load_all_datasets(n_gsm8k: int = 200, n_bbh_per_subtask: int = 60, n_truthfulqa: int = 200, seed: int = 42) -> dict:
+    """Load all 3 datasets and return {'gsm8k': [...], 'bbh': [...], 'truthfulqa': [...]}."""
+    return {
+        "gsm8k":      load_gsm8k(n_gsm8k, seed),
+        "bbh":        load_bbh(n_bbh_per_subtask, seed),
+        "truthfulqa": load_truthfulqa(n_truthfulqa, seed),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Paraphrase cache helpers
+# ---------------------------------------------------------------------------
+
 def load_paraphrase_cache(path: Path) -> dict:
     if path.exists():
         with open(path) as f:
@@ -96,6 +109,11 @@ def save_paraphrase_cache(cache: dict, path: Path):
         json.dump(cache, f, indent=2)
 
 
+def save_paraphrases(paraphrases: dict, path: Path):
+    """Alias of save_paraphrase_cache — matches the notebook's call signature."""
+    save_paraphrase_cache(paraphrases, path)
+
+
 def get_paraphrases(sample_id: str, cache: dict) -> list[str] | None:
     return cache.get(sample_id)
 
@@ -103,6 +121,10 @@ def get_paraphrases(sample_id: str, cache: dict) -> list[str] | None:
 def set_paraphrases(sample_id: str, paraphrases: list[str], cache: dict):
     cache[sample_id] = paraphrases
 
+
+# ---------------------------------------------------------------------------
+# Save / load helpers
+# ---------------------------------------------------------------------------
 
 def save_samples(samples: list[dict], path: Path):
     with open(path, "w") as f:

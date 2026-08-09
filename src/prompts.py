@@ -6,8 +6,16 @@ Three evaluation axes:
   3. Consistency   — paraphrase variants of the same question
 """
 
+# ---------------------------------------------------------------------------
+# Confidence elicitation suffix (appended for calibration axis)
+# ---------------------------------------------------------------------------
+
 CONFIDENCE_SUFFIX = "\nConfidence: <0-100>"
 
+
+# ---------------------------------------------------------------------------
+# System prompts
+# ---------------------------------------------------------------------------
 
 SYSTEM_DIRECT = (
     "You are a helpful assistant. Answer the question concisely. "
@@ -20,53 +28,67 @@ SYSTEM_COT = (
 )
 
 
-def make_gsm8k_direct(question: str) -> list[dict]:
+# ---------------------------------------------------------------------------
+# Dataset-specific message builders
+# ---------------------------------------------------------------------------
+
+def _gsm8k_messages(question: str, mode: str) -> list[dict]:
+    if mode == "cot":
+        return [
+            {"role": "system", "content": SYSTEM_COT},
+            {"role": "user",   "content": f"Question: {question}"},
+        ]
     return [
-        {"role": "system",  "content": SYSTEM_DIRECT},
-        {"role": "user",    "content": f"Question: {question}\nAnswer:"},
+        {"role": "system", "content": SYSTEM_DIRECT},
+        {"role": "user",   "content": f"Question: {question}\nAnswer:"},
     ]
 
 
-def make_gsm8k_cot(question: str) -> list[dict]:
+def _bbh_messages(question: str, mode: str) -> list[dict]:
+    if mode == "cot":
+        return [
+            {"role": "system", "content": SYSTEM_COT},
+            {"role": "user",   "content": f"Question: {question}"},
+        ]
     return [
-        {"role": "system",  "content": SYSTEM_COT},
-        {"role": "user",    "content": f"Question: {question}"},
+        {"role": "system", "content": SYSTEM_DIRECT},
+        {"role": "user",   "content": f"Question: {question}\nAnswer:"},
     ]
 
 
-def make_bbh_direct(question: str) -> list[dict]:
-    return [
-        {"role": "system",  "content": SYSTEM_DIRECT},
-        {"role": "user",    "content": f"Question: {question}\nAnswer:"},
-    ]
-
-
-def make_bbh_cot(question: str) -> list[dict]:
-    return [
-        {"role": "system",  "content": SYSTEM_COT},
-        {"role": "user",    "content": f"Question: {question}"},
-    ]
-
-
-def make_truthfulqa_direct(question: str, choices: list[str]) -> list[dict]:
+def _truthfulqa_messages(question: str, mode: str, choices: list[str] | None) -> list[dict]:
+    choices = choices or []
     choices_str = "\n".join(f"{chr(65+i)}. {c}" for i, c in enumerate(choices))
+    if mode == "cot":
+        return [
+            {"role": "system", "content": SYSTEM_COT},
+            {"role": "user",   "content": f"Question: {question}\n{choices_str}"},
+        ]
     return [
-        {"role": "system",  "content": SYSTEM_DIRECT},
-        {"role": "user",    "content": f"Question: {question}\n{choices_str}\nAnswer (letter only):"},
+        {"role": "system", "content": SYSTEM_DIRECT},
+        {"role": "user",   "content": f"Question: {question}\n{choices_str}\nAnswer (letter only):"},
     ]
 
 
-def make_truthfulqa_cot(question: str, choices: list[str]) -> list[dict]:
-    choices_str = "\n".join(f"{chr(65+i)}. {c}" for i, c in enumerate(choices))
-    return [
-        {"role": "system",  "content": SYSTEM_COT},
-        {"role": "user",    "content": f"Question: {question}\n{choices_str}"},
-    ]
+_DATASET_BUILDERS = {
+    "gsm8k":      lambda q, mode, choices=None: _gsm8k_messages(q, mode),
+    "bbh":        lambda q, mode, choices=None: _bbh_messages(q, mode),
+    "truthfulqa": lambda q, mode, choices=None: _truthfulqa_messages(q, mode, choices),
+}
 
 
-def make_calibration_prompt(base_messages: list[dict]) -> list[dict]:
-    """Takes any base prompt and appends confidence elicitation to last user turn."""
-    msgs = [m.copy() for m in base_messages]
+# ---------------------------------------------------------------------------
+# Public API — called directly by the notebooks
+# ---------------------------------------------------------------------------
+
+def make_accuracy_prompt(question: str, mode: str, dataset: str, choices: list[str] | None = None) -> list[dict]:
+    """Direct or CoT prompt for the accuracy axis (Step 2)."""
+    return _DATASET_BUILDERS[dataset](question, mode, choices)
+
+
+def make_calibration_prompt(question: str, mode: str, dataset: str, choices: list[str] | None = None) -> list[dict]:
+    """Accuracy prompt + verbalized confidence elicitation suffix (Step 3)."""
+    msgs = [m.copy() for m in make_accuracy_prompt(question, mode, dataset, choices)]
     for i in reversed(range(len(msgs))):
         if msgs[i]["role"] == "user":
             msgs[i]["content"] = msgs[i]["content"] + CONFIDENCE_SUFFIX
@@ -74,17 +96,18 @@ def make_calibration_prompt(base_messages: list[dict]) -> list[dict]:
     return msgs
 
 
-def make_paraphrase_prompt(question: str, variant_idx: int) -> list[dict]:
-    styles = [
-        "Rephrase this question using different words but preserve the exact meaning.",
-        "Rewrite this question in a more formal style.",
-        "Rewrite this question in a simpler, more casual style.",
-        "Rephrase this question starting with a different subject.",
-        "Rewrite this question as if explaining to a student.",
-        "Paraphrase this question using synonyms where possible.",
-    ]
-    style = styles[variant_idx % len(styles)]
+def make_consistency_prompt(question: str, mode: str, dataset: str, choices: list[str] | None = None) -> list[dict]:
+    """Same as accuracy prompt — used to re-run paraphrase variants (Step 4)."""
+    return make_accuracy_prompt(question, mode, dataset, choices)
+
+
+def make_paraphrase_gen_prompt(question: str) -> list[dict]:
+    """Ask a model to generate 5 numbered paraphrases of a question (Step 1)."""
     return [
-        {"role": "system", "content": "You are a paraphrasing assistant. Output only the rewritten question, nothing else."},
-        {"role": "user",   "content": f"{style}\n\nOriginal: {question}\n\nParaphrase:"},
+        {"role": "system", "content": (
+            "You are a paraphrasing assistant. Given a question, generate 5 paraphrases "
+            "that preserve the exact meaning but vary the wording, style, and phrasing. "
+            "Output exactly 5 lines, numbered 1-5, one paraphrase per line, nothing else."
+        )},
+        {"role": "user", "content": f"Original question: {question}\n\nGenerate 5 paraphrases:"},
     ]

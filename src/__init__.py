@@ -1,1 +1,0 @@
-# LIGHT paper — source package
