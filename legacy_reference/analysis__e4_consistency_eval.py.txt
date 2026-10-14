@@ -1,0 +1,174 @@
+"""
+e4_consistency_eval.py — FAST BATCHED Paraphrase Consistency for Filler-CoT
+========================================================================
+Batched version of the cross-scale paraphrase consistency check.
+Processes 4-8 sequences simultaneously to maximize GPU utilization.
+"""
+
+import json
+import re
+import random
+import numpy as np
+import pandas as pd
+import torch
+import gc
+from pathlib import Path
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+RESULTS = Path("results")
+DATA = Path("data")
+RESULTS.mkdir(exist_ok=True)
+
+SYSTEM_FILLER = (
+    "You are a helpful assistant. Before answering, share your general thoughts "
+    "and associations about the topic. Reflect broadly on what comes to mind, "
+    "then give your final answer. End your response with 'Answer: <your answer>'."
+)
+
+MODELS = [
+    ("Qwen2.5-0.5B", "Qwen/Qwen2.5-0.5B-Instruct"),
+    ("Llama-3.2-1B", "meta-llama/Llama-3.2-1B-Instruct"),
+    ("Qwen2.5-1.5B", "Qwen/Qwen2.5-1.5B-Instruct"),
+    ("Llama-3.2-3B", "meta-llama/Llama-3.2-3B-Instruct")
+]
+
+def parse_answer(text):
+    m = re.findall(r'Answer:\s*([+-]?\d[\d,\.]*|[A-D])', text, re.IGNORECASE)
+    if m:
+        return m[-1].replace(',', '').strip().lower()
+    all_tokens = text.strip().split()
+    return all_tokens[-1].lower() if all_tokens else ""
+
+def free_memory():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+def evaluate_filler_consistency(model_name, hf_id, para_dict, limit_questions=25):
+    print(f"\n[Consistency] Loading {model_name}...")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    tokenizer = AutoTokenizer.from_pretrained(hf_id, trust_remote_code=True)
+    # Crucial for batched generation
+    tokenizer.padding_side = "left"
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = AutoModelForCausalLM.from_pretrained(
+        hf_id, torch_dtype=torch.float16, trust_remote_code=True
+    ).to(device)
+    model.eval()
+
+    valid_items = {k: v for k, v in para_dict.items() if len(v) >= 3}
+    selected_keys = list(valid_items.keys())[:limit_questions]
+    print(f"[Consistency] Evaluating {model_name} on {len(selected_keys)} questions * 4 variants using BATCHED inference...")
+
+    results = []
+    
+    for q_idx, q_key in enumerate(selected_keys):
+        variants = valid_items[q_key][:4]
+        
+        # Prepare batched prompts
+        prompts = []
+        for text in variants:
+            messages = [
+                {"role": "system", "content": SYSTEM_FILLER},
+                {"role": "user", "content": f"Question: {text}\nAnswer:"}
+            ]
+            prompt_str = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            prompts.append(prompt_str)
+            
+        inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=1024).to(device)
+        input_len = inputs["input_ids"].shape[1]
+
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs, 
+                max_new_tokens=256, 
+                do_sample=False, 
+                pad_token_id=tokenizer.eos_token_id
+            )
+            
+        # Decode and parse batch
+        for p_idx, out_seq in enumerate(outputs):
+            resp = tokenizer.decode(out_seq[input_len:], skip_special_tokens=True).strip()
+            pred = parse_answer(resp)
+            results.append({
+                "model": model_name,
+                "question_id": q_key,
+                "variant_idx": p_idx,
+                "predicted": pred,
+            })
+            
+    del model
+    del tokenizer
+    free_memory()
+
+    res_df = pd.DataFrame(results)
+    
+    # Compute consistency rate
+    agreements = []
+    for q_id, grp in res_df.groupby("question_id"):
+        preds = grp["predicted"].tolist()
+        if len(preds) > 1:
+            agree_count = sum(1 for i in range(len(preds)) for j in range(i+1, len(preds)) if preds[i] == preds[j] and len(preds[i]) > 0)
+            total_pairs = len(preds) * (len(preds) - 1) / 2
+            agreements.append(agree_count / total_pairs if total_pairs > 0 else 0.0)
+
+    return float(np.mean(agreements)), res_df
+
+def main():
+    print("=" * 90)
+    print("EXPERIMENT E4: FAST BATCHED PARAPHRASE CONSISTENCY OF FILLER-CoT")
+    print("=" * 90)
+
+    with open(DATA / "paraphrases.json") as f:
+        para_dict = json.load(f)
+
+    all_results = []
+    summary_data = []
+
+    consist_summary_path = RESULTS / "consistency_summary.csv"
+    if consist_summary_path.exists():
+        consist_summary = pd.read_csv(consist_summary_path)
+    else:
+        consist_summary = None
+
+    for model_name, hf_id in MODELS:
+        try:
+            filler_consist, df = evaluate_filler_consistency(model_name, hf_id, para_dict, limit_questions=25)
+            all_results.append(df)
+            
+            dir_c = cot_c = 0.0
+            if consist_summary is not None:
+                sub = consist_summary[consist_summary["model"] == model_name]
+                if not sub.empty:
+                    dir_df = sub[sub["mode"] == "direct"]
+                    cot_df = sub[sub["mode"] == "cot"]
+                    if not dir_df.empty: dir_c = dir_df["consistency"].mean()
+                    if not cot_df.empty: cot_c = cot_df["consistency"].mean()
+                
+            summary_data.append({
+                "model": model_name,
+                "Direct_Consistency": dir_c,
+                "Filler_Consistency": filler_consist,
+                "CoT_Consistency": cot_c
+            })
+        except Exception as e:
+            print(f"Error evaluating {model_name}: {e}")
+
+    if all_results:
+        final_df = pd.concat(all_results, ignore_index=True)
+        final_df.to_csv(RESULTS / "e4_consistency_cross_scale_raw.csv", index=False)
+
+    print("\n" + "=" * 90)
+    print("CROSS-SCALE FILLER CONSISTENCY RESULTS")
+    print("=" * 90)
+    print(f"{'Model':15s} | {'Direct Consist':>15s} | {'Filler Consist':>15s} | {'CoT Consist':>15s}")
+    print("-" * 90)
+    for row in summary_data:
+        print(f"{row['model']:15s} | {row['Direct_Consistency']*100:14.1f}% | {row['Filler_Consistency']*100:14.1f}% | {row['CoT_Consistency']*100:14.1f}%")
+    print("=" * 90)
+
+if __name__ == "__main__":
+    main()

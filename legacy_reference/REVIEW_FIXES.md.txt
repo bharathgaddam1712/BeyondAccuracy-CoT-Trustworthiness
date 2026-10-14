@@ -1,0 +1,89 @@
+# Data Audit & Review Corrections Reference
+
+This document tracks all audited corrections between the narrative documentation and the released CSV datasets in results/summary/ and results/. Every entry documents the exact CSV ground-truth, the prior inaccurate statement, and the audited correction.
+
+---
+
+## 1. Matched-Subset Calibration Audit (Tier 1, Item 1)
+
+* **Released CSV Source:** esults/summary/matched_subset_calibration.csv* **Audited Ground Truth Matrix:**
+
+| Model | Matched Questions | Matched Direct ECE | Matched Filler ECE | Matched CoT ECE | Filler Beats Direct? | Family Finding |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Qwen2.5-0.5B** | N=157 | 0.2815 | **0.1350** | 0.1448 | **\True\** (Δ = -0.1465) | Filler outperforms CoT & Direct |
+| **Qwen2.5-1.5B** | N=137 | 0.3006 | **0.2124** | 0.2359 | **\True\** (Δ = -0.0882) | Filler outperforms CoT & Direct |
+| **Gemma-2-2B** | N=112 | 0.3072 | **0.1730** | 0.2306 | **\True\** (Δ = -0.1342) | Filler outperforms CoT & Direct |
+| **Llama-3.2-1B** | N=144 | **0.2138** | 0.2292 | **0.1778** | **\False\** (Δ = +0.0154) | CoT is optimal; Filler slightly hurts |
+| **Llama-3.2-3B** | N=141 | **0.1785** | 0.2737 | 0.2951 | **\False\** (Δ = +0.0952) | Direct is optimal; Buffer increases ECE |
+
+* **Prior Doc Discrepancy:** The table stated Llama-1B had Direct 0.198 / Filler 0.162 / CoT 0.171 with 'filler gain persists (Δ = -3.6%)'.
+* **Audited Correction:** The CSV demonstrates that filler benefits are **model-family dependent**: Qwen and Gemma architectures show strong filler gains (p < 0.01), whereas Llama architectures do not benefit from filler buffers (\iller_beats_direct_matched = False\).
+
+---
+
+## 2. Out-of-Distribution (OOD) Cross-Dataset Transfer (Tier 1, Item 2)
+
+* **Released CSV Source:** esults/summary/probe_v2_transfer.csv* **Audited Ground Truth Matrix:**
+
+| Model | Mode | Train → Test Pair | Transfer AUROC | 95% Bootstrap CI | Generalization Verdict |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Qwen2.5-0.5B** | \direct\ | GSM8K → ARC | 0.4610 | [0.3479, 0.5815] | At / Below Chance (No Transfer) |
+| **Qwen2.5-0.5B** | \direct\ | ARC → GSM8K | 0.4405 | [0.2806, 0.5984] | At / Below Chance (No Transfer) |
+| **Qwen2.5-0.5B** | \direct\ | GSM8K → BBH | 0.4707 | [0.3617, 0.5736] | At / Below Chance (No Transfer) |
+| **Qwen2.5-0.5B** | \direct\ | BBH → TruthfulQA | 0.3827 | [0.2569, 0.5319] | Below Chance |
+| **Llama-3.2-1B** | \direct\ | GSM8K → ARC | 0.5878 | [0.4699, 0.6953] | Moderate Transfer |
+| **Llama-3.2-1B** | \direct\ | ARC → GSM8K | 0.5978 | [0.4986, 0.6979] | Moderate Transfer |
+| **Llama-3.2-1B** | \direct\ | BBH → TruthfulQA | 0.5755 | [0.4105, 0.7313] | Moderate Transfer |
+| **Qwen2.5-1.5B** | \direct\ | GSM8K → BBH | **0.7390** | [0.6289, 0.8334] | Strong Math → Logic Transfer |
+| **Gemma-2-2B** | \direct\ | GSM8K → ARC | 0.3952 | [0.2739, 0.5186] | Below Chance |
+| **Gemma-2-2B** | \direct\ | GSM8K → BBH | 0.3632 | [0.2792, 0.4488] | Below Chance |
+| **Llama-3.2-3B** | \direct\ | GSM8K → ARC | 0.4130 | [0.2959, 0.5247] | Below Chance |
+| **Llama-3.2-3B** | \direct\ | BBH → TruthfulQA | 0.2797 | [0.1169, 0.4738] | Below Chance |
+| **Llama-3.2-3B** | \scratchpad\| GSM8K → ARC | **0.8294** | [0.7463, 0.9050] | **Robust Domain Invariance** |
+| **Llama-3.2-3B** | \scratchpad\| ARC → GSM8K | **0.8712** | [0.8036, 0.9257] | **Robust Domain Invariance** |
+| **Llama-3.2-3B** | \scratchpad\| GSM8K → BBH | **0.8330** | [0.7499, 0.9073] | **Robust Domain Invariance** |
+| **Llama-3.2-3B** | \scratchpad\| BBH → TruthfulQA | **0.6214** | [0.5248, 0.7156] | Strong Transfer |
+
+* **Prior Doc Discrepancy:** Probes were claimed to have 'universal cross-domain correctness directions' based solely on positive pairs.
+* **Audited Correction:** Probes on small models in Direct mode generally do not transfer OOD (frequently hovering at 0.38–0.50). Domain invariance **emerges at 3B scale and under structured deliberation (Scratchpad AUROC 0.83–0.87)**.
+
+---
+
+## 3. 'Knows But Can\'t Say' Decodability Gap Significance (Tier 1, Item 3)
+
+* **Released CSV Source:** esults/summary/probe_v2_summary.csv* **Audited Ground Truth Matrix:**
+
+| Model | Mode | Verbalized AUROC | Probe AUROC @ 70% | Paired Gap Δ | p-value | Significance |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Qwen2.5-0.5B** | \direct\ | 0.3064 | 0.6815 | **\+0.2540\** | **\p = 0.0036\** | **Significant** ✅ |
+| **Llama-3.2-1B** | \direct\ | 0.6065 | 0.7362 | \+0.0314\ | p = 0.6568 | Not Significant (ns) |
+| **Qwen2.5-1.5B** | \direct\ | 0.5685 | 0.7404 | \-0.0403\ | p = 0.7028 | Not Significant (ns) |
+| **Gemma-2-2B** | \direct\ | 0.5108 | 0.8319 | — | — (N_pos < 15) | Uncomputed in Direct |
+| **Llama-3.2-3B** | \direct\ | 0.4775 | 0.7661 | \+0.0640\ | p = 0.6476 | Not Significant (ns) |
+| **Qwen2.5-0.5B** | \cot\ | 0.5215 | 0.6617 | **\+0.1338\** | **\p < 0.0001\** | **Significant** ✅ |
+| **Llama-3.2-1B** | \cot\ | 0.5279 | 0.6255 | **\+0.1273\** | **\p = 0.0020\** | **Significant** ✅ |
+| **Qwen2.5-1.5B** | \cot\ | 0.5557 | 0.6501 | **\+0.1086\** | **\p = 0.0052\** | **Significant** ✅ |
+| **Gemma-2-2B** | \cot\ | 0.5656 | 0.7112 | **\+0.1442\** | **\p < 0.0001\** | **Significant** ✅ |
+| **Llama-3.2-3B** | \cot\ | 0.5424 | 0.7281 | **\+0.2021\** | **\p < 0.0001\** | **Significant** ✅ |
+
+* **Prior Doc Discrepancy:** Direct gap claimed as universally significant for all models, with an invented p-value for Gemma direct.
+* **Audited Correction:** Direct mode paired gap is statistically significant specifically in **Qwen-0.5B** (p=0.0036). Gemma-2B has a large raw divergence (probe 0.83 vs verbalized 0.51), but its paired test in direct mode was omitted due to low parsed positives (N_pos=10 < 15). Under deliberation modes (CoT and Filler), **all 5 models show statistically significant decodability gaps ( < 0.05$)**.
+
+---
+
+## 4. Shuffled-CoT Accuracy Finding (Tier 1, Item 4)
+
+* **Released CSV Source:** esults/e9_shuffled_cot_Qwen2.5-0.5B.csv* **Audited Data:** Shuffled-CoT accuracy = 27.3% (N=167) vs. Structured-CoT = 22.8% on Qwen2.5-0.5B (p = 0.35, binomial difference within noise).
+* **Prior Doc Discrepancy:** Claimed 'accuracy is sensitive to step order; logical coherence dictates accuracy' despite shuffled being numerically higher.
+* **Audited Correction:** 'Accuracy is not reliably improved by coherent step ordering at 0.5B scale (difference within small-sample noise), confirming that small models do not reliably perform sequential deduction.'
+
+---
+
+## 5. Overclaims Softened & Key Theoretical Syntheses (Tiers 2 & 3)
+
+1. **Scaling Law Fit (E10):** Log-linear fit yields R² = 0.018. Claim softened from 'discontinuous changepoint' to 'ΔECE does not follow a smooth scaling law; the relationship is non-linear and family-dependent.'
+2. **Probing Scope:** Clarified as **5 model scales** (13,600 trajectories across 680 questions × 4 modes × 5 models), while behavioral evaluations span 11 models.
+3. **Scratchpad Framing:** Re-framed sub-2B scratchpad parse collapse as an **emission / syntactic termination failure** (unclosed <scratchpad> tags), uniting it under the broader emission bottleneck thesis.
+4. **Intellectual Core Synthesis (Murphy Decomposition + Probing):**
+   > *While verbalized confidence exhibits near-zero Resolution (Δ = +0.0005, p=0.82), intermediate layer representations achieve high linear probe AUROC (0.68 - 0.83). The model internally possesses the discriminatory resolution that its verbalized expression entirely lacks.*
+5. **CRU and Transfer Link:** Length-regime models (CRU ≤ 0) rely on shallow, non-transferring features; reasoning-regime models (≥ 3B, Scratchpad) form abstract, domain-general representations of solution correctness.

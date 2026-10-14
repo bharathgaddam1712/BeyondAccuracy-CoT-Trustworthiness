@@ -1,0 +1,626 @@
+\documentclass{article}
+
+% ============================================================================
+% Official NeurIPS 2026 style file (neurips_2026.sty, in this same folder),
+% fetched from the NeurIPS style-file kit. This is the actual double-blind
+% workshop submission format.
+%
+% At submission time (this file, and paper.tex): omit `final`. This anonymizes
+% the author block and adds review line numbers automatically.
+% For camera-ready, after acceptance, switch to:
+%     \usepackage[dblblindworkshop,final]{neurips_2026}
+% and fill in the real \author{} block below (the final option de-anonymizes).
+% ============================================================================
+\usepackage[dblblindworkshop]{neurips_2026}
+\workshoptitle{LIGHT Workshop}
+\nolinenumbers
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    citecolor=blue,
+    urlcolor=blue,
+}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsfonts}
+\usepackage{amsmath}
+\usepackage{nicefrac}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\graphicspath{{../figures/}}
+\usepackage{subcaption}
+\usepackage{longtable}
+
+\title{Beyond Accuracy: Calibration, Confidence, and Paraphrase Robustness of Chain-of-Thought Reasoning in Sub-3B Language Models}
+
+% ----------------------------------------------------------------------------
+% TODO: fill in real author list / affiliations before camera-ready. The
+% LIGHT workshop is double-blind, so this block is ignored by the style file
+% at submission time (it prints "Anonymous Author(s)" regardless of what is
+% written here) and only takes effect once `final` is added above.
+% ----------------------------------------------------------------------------
+\author{%
+  Anonymous Author(s) \\
+  Affiliation \\
+  \texttt{email@example.com}
+}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Chain-of-thought (CoT) prompting is widely reported to improve the \emph{accuracy} of large language models, but accuracy is only one axis of trustworthiness. We present a systematic empirical study of CoT's effect on three additional axes --- \textbf{calibration} (do stated confidences match correctness?), \textbf{verbalized confidence reliability}, and \textbf{paraphrase consistency} (does the answer change under semantically equivalent rephrasings?) --- across seven models spanning 0.5B--8B parameters (Qwen2.5, Llama-3.2/3.1, Gemma-2) and three benchmarks (GSM8K, BIG-Bench Hard, TruthfulQA). We pre-registered three scaling-threshold hypotheses predicting that CoT would \emph{degrade} calibration and consistency below 3B parameters and \emph{reverse} to helping above it. After discovering and correcting a confidence-elicitation prompt bug and a response-storage truncation bug that had inflated our missing-confidence rate to 49\%, none of the three hypotheses hold on the corrected data. Instead, we find a \textbf{decoupled pattern}: CoT improves calibration consistently at small scale (sub-3B ECE drops from 0.455 to 0.383 under CoT) and improves paraphrase consistency consistently at larger scale ($\geq$3B delta $= +0.040$), but these two benefits do not co-occur at a shared size threshold as the reverse-at-3B narrative would predict. We report this as a clean negative result against the simple scaling-threshold story, document the calibration bug and its effect on hypothesis outcomes as a methodological cautionary tale, and release the full reproducible pipeline.
+\end{abstract}
+
+\section{Introduction}
+
+Most LLM evaluation collapses ``how good is this model'' into a single number: accuracy. But a model can be accurate and still be an unreliable \emph{collaborator} --- it can be confidently wrong, or give a different answer when the same question is asked with different words. These failure modes matter most for the class of models increasingly deployed on-device or in cost-constrained settings: sub-3B parameter language models (SLMs).
+
+Chain-of-thought (CoT) prompting --- asking a model to reason step-by-step before answering --- is the default technique for boosting accuracy, and is often applied uncritically to SLMs on the assumption that ``more reasoning is better.'' We ask a narrower, more useful question: \emph{for models too small to reliably execute multi-step reasoning, does forcing a reasoning trace help or hurt the properties that make a model trustworthy to use --- calibration and consistency --- even when it does help accuracy?}
+
+We study this along three axes across seven models (0.5B--8B) and three tasks:
+
+\begin{enumerate}
+    \item \textbf{Calibration} --- does verbalized confidence track actual correctness (ECE, Brier score, AUROC, AURC)?
+    \item \textbf{Confidence reliability} --- how often do models even produce a usable confidence estimate when asked, and does this depend on model size and prompting mode?
+    \item \textbf{Paraphrase consistency} --- does the model's answer stay the same across five semantically-equivalent rephrasings of the same question?
+\end{enumerate}
+
+We pre-registered three hypotheses before running the full pipeline (Section~\ref{sec:hypotheses}), predicting a \emph{reversal} at approximately 3B parameters: CoT hurts calibration and consistency below the threshold, and helps above it. This hypothesis is intuitive --- it mirrors ``emergent ability'' narratives in the scaling-law literature --- but \textbf{it does not survive contact with corrected data}. We view the honest reporting of this negative result, plus the specific measurement pitfalls that nearly caused us to publish the opposite (wrong) conclusion, as a central contribution of this paper.
+
+\paragraph{Contributions.}
+\begin{itemize}
+    \item A 7-model $\times$ 3-benchmark study of CoT's effect on calibration and paraphrase consistency, orthogonal to the standard accuracy-only evaluation.
+    \item Identification and correction of two measurement bugs --- a confidence-elicitation prompt conflict and a response-storage truncation artifact --- that inflated missing-confidence rates from an expected background rate to 49\% and, critically, \textbf{flipped the sign of our primary calibration hypothesis}.
+    \item An EOS-based generation-cap diagnostic that empirically verifies a chosen \texttt{max\_new\_tokens} budget is sufficient, rather than assuming it from a fixed constant.
+    \item A falsification of the ``CoT reverses trustworthiness effects at 3B'' hypothesis, replaced with an empirical finding that calibration and consistency benefits from CoT are \emph{decoupled across scale}, not co-occurring.
+\end{itemize}
+
+\section{Related Work}
+\label{sec:related}
+
+\subsection{Chain-of-Thought Reasoning}
+
+Chain-of-thought (CoT) prompting, in which a model is asked to produce intermediate reasoning steps before its final answer, was shown by \citet{wei2022chain} to substantially improve performance on arithmetic, commonsense, and symbolic reasoning benchmarks for sufficiently large models. \citet{kojima2022zeroshot} showed the effect persists even without exemplars, using a single zero-shot ``Let's think step by step'' trigger. \citet{wang2023selfconsistency} extended CoT with sample-and-vote decoding (self-consistency), improving accuracy further at the cost of multiple generations per question. \citet{suzgun2023bbh} curated BIG-Bench Hard (BBH, one of our three benchmarks) specifically to probe tasks where standard prompting struggles and CoT provides the largest lift. All four of these works report accuracy exclusively; none examine calibration or paraphrase consistency, the two axes we study.
+
+\subsection{Calibration and Verbalized Uncertainty}
+
+Expected Calibration Error (ECE), our primary calibration metric, follows the binning protocol introduced for modern neural networks by \citet{guo2017calibration}, who showed that well-trained classifiers are frequently overconfident relative to their true accuracy. For generative LLMs, \citet{kadavath2022know} found that models' self-assessed probability of having answered correctly (``P(True)'') is a moderately reliable signal on multiple-choice tasks at sufficient scale, while \citet{lin2022teaching} showed models can be trained to express calibrated uncertainty directly in natural language. \citet{xiong2024uncertainty} systematically compared confidence-elicitation strategies (verbalized, direct-probability, and consistency-based) across model families and found no single method dominates, and \citet{tian2023justask} showed that verbalized confidence from RLHF-tuned models is often better calibrated than the model's own token-level probabilities, but is highly sensitive to elicitation prompt phrasing --- a sensitivity we independently rediscover as a measurement bug in Section~\ref{sec:bug}. \citet{zhao2021calibrate} separately showed that few-shot prompt \emph{choice} biases a model's output distribution in a correctable way, reinforcing the broader theme that calibration in LLMs is prompt-fragile rather than a fixed model property. None of this prior work isolates \emph{model scale} as the axis of interest for CoT's effect on calibration specifically, which is our focus.
+
+\subsection{Consistency and Robustness to Input Variation}
+
+\citet{elazar2021consistency} introduced the paraphrase-consistency protocol we adopt: querying a model with multiple meaning-preserving rewrites of the same fact and measuring answer agreement, finding pretrained masked language models to be substantially inconsistent. \citet{sclar2024quantifying} showed a related fragility at the level of \emph{prompt formatting} rather than semantic paraphrase --- swapping delimiters or field order in an otherwise-fixed prompt changes accuracy by tens of points on some models --- reinforcing that consistency failures are not limited to adversarial inputs but occur under innocuous, semantically-neutral changes. We extend the paraphrase-consistency protocol of \citet{elazar2021consistency} to instruction-tuned generative models under CoT vs.\ direct prompting, which, to our knowledge, has not previously been studied as a function of parameter count.
+
+\subsection{Scaling Laws and Emergent Abilities}
+
+\citet{kaplan2020scaling} and \citet{hoffmann2022chinchilla} established that pretraining loss decreases predictably (as a power law) with model size, data, and compute, but predictable loss does not imply predictable behavior on discrete downstream metrics: \citet{wei2022emergent} catalogued a range of capabilities (including successful CoT reasoning) that appear to emerge sharply at particular parameter thresholds rather than improving smoothly. \citet{schaeffer2023mirage} subsequently argued that many reported ``emergent'' jumps are artifacts of using a discontinuous (e.g., exact-match) metric on a continuously-improving underlying quantity, and vanish when a smoother metric is substituted. Our own pre-registered hypothesis (Section~\ref{sec:hypotheses}) was explicitly modeled on the emergence-at-a-threshold narrative critiqued by \citet{schaeffer2023mirage}; Section~\ref{sec:bug-effect} shows that in our case the apparent threshold effect was in fact a measurement artifact of a different kind (a confidence-elicitation pipeline bug, not a metric-discontinuity issue), which we view as a complementary cautionary tale to theirs.
+
+\subsection{Model Cascades and Routing}
+
+A separate line of work treats model scale as a cost/quality knob to be optimized at inference time rather than a fixed choice: \citet{chen2023frugalgpt} route individual queries across a cascade of LLM APIs of increasing cost, escalating only when a cheaper model's response is predicted to be insufficient, while \citet{ong2024routellm} and \citet{ding2024hybridllm} learn routing policies directly from preference- and quality-labeled data to decide, per query, whether a small or large model should serve a given request. These systems typically rely on the small model's own confidence, or a learned quality predictor, to decide when to escalate. Our finding that verbalized confidence is well-calibrated for small models specifically under CoT prompting (Section~\ref{sec:results-accuracy}) suggests CoT-elicited confidence may be a particularly good escalation signal for exactly this class of system, a connection we return to in Section~\ref{sec:discussion}.
+
+\section{Method}
+
+\subsection{Models}
+\label{sec:models}
+
+Seven instruction-tuned models spanning two orders of magnitude in parameter count (Table~\ref{tab:models}), drawn from the Qwen2.5 \citep{qwen2024technical}, Llama-3 \citep{grattafiori2024llama3}, and Gemma-2 \citep{gemmateam2024gemma2} families. All three families are instruction-tuned via supervised fine-tuning and RLHF-style preference alignment \citep{ouyang2022instructgpt} on top of their base pretrained checkpoints. All generation is greedy (\texttt{do\_sample=False}) for determinism. The 8B model uses 4-bit NF4 quantization \citep{dettmers2023qlora} for memory; all others run in fp16. All experiments ran on Kaggle's 2$\times$T4 free tier.
+
+\begin{table}[h]
+\centering
+\caption{Model registry.}
+\label{tab:models}
+\begin{tabular}{lccc}
+\toprule
+Model & Size (B) & Family & Quantization \\
+\midrule
+Qwen2.5-0.5B-Instruct   & 0.5 & Qwen  & fp16 \\
+Llama-3.2-1B-Instruct   & 1.0 & Llama & fp16 \\
+Qwen2.5-1.5B-Instruct   & 1.5 & Qwen  & fp16 \\
+Gemma-2-2b-it           & 2.0 & Gemma & fp16 \\
+Qwen2.5-3B-Instruct     & 3.0 & Qwen  & fp16 \\
+Llama-3.2-3B-Instruct   & 3.0 & Llama & fp16 \\
+Llama-3.1-8B-Instruct   & 8.0 & Llama & 4-bit NF4 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Benchmarks}
+
+We evaluate on three established benchmarks spanning arithmetic reasoning, adversarial factuality, and diverse hard reasoning tasks: GSM8K \citep{cobbe2021gsm8k}, TruthfulQA \citep{lin2022truthfulqa}, and BIG-Bench Hard (BBH) \citep{suzgun2023bbh} (Table~\ref{tab:benchmarks}).
+
+\begin{table}[h]
+\centering
+\caption{Benchmarks.}
+\label{tab:benchmarks}
+\begin{tabular}{lccc}
+\toprule
+Dataset & Task type & $n$ & Answer format \\
+\midrule
+GSM8K & Grade-school math word problems & 200 & Numeric \\
+BIG-Bench Hard (BBH) & Diverse hard reasoning (subset) & 180 & Letter / short answer \\
+TruthfulQA & Adversarial factuality, multiple-choice & 200 & Letter (A--J) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Experimental Axes}
+
+\paragraph{Accuracy (Step 2).} Direct-answer vs.\ CoT prompting, scored per-dataset with dataset-specific parsers. Section~\ref{sec:results-accuracy} details two scoring bugs found and fixed post-hoc via \texttt{rescore\_accuracy.py}, affecting BBH letter-matching, GSM8K trailing-punctuation, and TruthfulQA's restriction to A--D when the true answer range extends to A--J.
+
+\paragraph{Calibration (Step 3).} Same prompts, with an appended confidence-elicitation suffix (\texttt{"Confidence: <0-100>"}) on GSM8K and TruthfulQA (BBH excluded --- answers too short for a meaningful confidence ask). Confidence is parsed via regex from the free-text response. We report Expected Calibration Error (ECE, 10 bins), Brier score, AUROC (confidence as a correct/incorrect classifier), and AURC (accuracy--rejection curve).
+
+\paragraph{Consistency (Step 4).} Each question is paraphrased 5 ways (via a separate LLM paraphrase-generation pass, Step 1) and re-run under the same direct/CoT prompting. Consistency is the fraction of paraphrase pairs where the answer is unchanged; the \textbf{consistency delta} (our primary consistency metric) is $\text{consistency}(\text{CoT}) - \text{consistency}(\text{Direct})$ per model per dataset.
+
+\subsection{Pre-Registered Hypotheses}
+\label{sec:hypotheses}
+
+Before running Step 3/4 in full, we pre-registered three hypotheses, motivated by the intuition that CoT requires a minimum capacity to execute reliably, and that models below this capacity would show CoT-induced degradation on trust metrics even where CoT still helps raw accuracy:
+
+\begin{description}
+    \item[H1:] CoT \emph{increases} ECE (worsens calibration) for sub-3B models, relative to direct answering.
+    \item[H2:] CoT \emph{decreases} paraphrase consistency for sub-3B models.
+    \item[H3:] Both effects \emph{reverse} at $\geq$3B parameters --- CoT improves both calibration and consistency once models are large enough to execute multi-step reasoning reliably.
+\end{description}
+
+\subsection{Reproducibility Infrastructure}
+
+All steps run in a single checkpointed, resumable pipeline (\texttt{beyond\_accuracy\_full\_pipeline.ipynb}) built for Kaggle's session-limited free tier: every step is gated by a \texttt{checkpoints/stepN.done} marker, and every result CSV is independently resumable via \texttt{(model, mode, dataset)}-level skip logic, so an interrupted 12-hour session resumes mid-step rather than from the last completed step. Code, results, and figures are versioned in a public GitHub repository (link in camera-ready).
+
+\section{The Calibration Measurement Bug (and Why It Matters)}
+\label{sec:bug}
+
+We surface this section prominently --- ahead of the results --- because it materially changed our conclusions, and we think the failure mode is common enough to be useful to other researchers running similar verbalized-confidence pipelines.
+
+\subsection{Two Bugs}
+
+\textbf{Bug 1 --- system prompt conflict.} Our direct-mode system prompt instructed models to ``give only the final answer with no explanation.'' When the calibration axis appended a confidence-elicitation suffix to the same prompt, this created a direct contradiction: models were simultaneously told to suppress all output beyond the answer \emph{and} asked to add a confidence line. Models overwhelmingly obeyed the stronger, first-listed instruction and omitted confidence entirely --- in the worst-affected combinations (e.g.\ \texttt{Llama-3.2-3B / direct / truthfulqa}), \textbf{100\% of responses were missing a confidence value}.
+
+\textbf{Bug 2 --- response-storage truncation.} Independently, raw model responses were truncated to 600 characters at write time before confidence parsing. Verbose CoT responses that reasoned at length before stating a final confidence line frequently had that trailing line truncated away --- a genuine confidence statement was generated but never recorded.
+
+\textbf{Combined effect:} across all 28 (model $\times$ mode $\times$ dataset) calibration combinations, \textbf{49.1\%} of rows had no parseable confidence value, with individual combinations as high as 100\%.
+
+\subsection{The Fix}
+
+\begin{enumerate}
+    \item Introduced calibration-specific system prompts (\texttt{SYSTEM\_DIRECT\_CALIBRATION}, \texttt{SYSTEM\_COT\_CALIBRATION}) that explicitly \emph{require} the confidence line rather than forbidding all explanation, resolving the direct-mode contradiction.
+    \item Removed the 600-character storage truncation; full responses are now persisted.
+    \item Added an \textbf{EOS-based generation-cap diagnostic}: for each response, we check whether generation stopped naturally (hit an EOS token) or was cut off by the \texttt{max\_new\_tokens} budget. This turns ``is our token budget large enough?'' from a guess into a measured fact. Raising the cap from an original 640/768 tokens to 1024 and re-running with this diagnostic active, \textbf{0 of 5,600 generated responses hit the cap without reaching EOS} --- confirming 1024 tokens is sufficient headroom and any remaining missing-confidence cases are not a truncation artifact.
+\end{enumerate}
+
+\subsection{Residual Missing-Confidence Rate}
+
+After both fixes, the overall missing-confidence rate dropped from 49.1\% to \textbf{8.0\%}. We manually inspected the residual cases and found two distinct causes, neither a pipeline bug:
+
+\begin{itemize}
+    \item \textbf{Degenerate repetition loops} (3 of 5,600 rows): the model enters a repeating text loop (e.g., a Llama-3.1-8B CoT response looping ``What I Know Is\ldots'' indefinitely) and never reaches a confidence statement.
+    \item \textbf{Instruction-following failure in the smallest models} (bulk of the remainder): concentrated almost entirely in Qwen2.5-0.5B and Llama-3.2-1B on TruthfulQA, where terse $\sim$90-character responses (e.g., simply ``Human rights'') ignore the confidence-line instruction outright. \texttt{Qwen2.5-0.5B / direct / truthfulqa} retains the highest residual rate at 75.5\% ($n_{\text{valid}}=49/200$).
+\end{itemize}
+
+We treat this residual pattern itself as a finding: \textbf{verbalized confidence elicitation is not a reliable protocol for the smallest instruction-tuned models}, independent of prompt engineering --- they frequently do not follow the confidence-line instruction at all. We flag \texttt{Qwen2.5-0.5B / direct / truthfulqa}'s thin $n_{\text{valid}}=49$ sample explicitly in Figure~\ref{fig:fig2} as a low-confidence data point rather than omitting it.
+
+\subsection{Effect on Our Hypotheses}
+\label{sec:bug-effect}
+
+This is the crux of the paper. Recomputing H1--H3 on the corrected data \textbf{reverses or falsifies all three} (Table~\ref{tab:hypotheses}).
+
+\begin{table}[h]
+\centering
+\small
+\caption{Pre-registered hypotheses: buggy vs.\ corrected outcome.}
+\label{tab:hypotheses}
+\begin{tabular}{p{2.6cm}p{4.6cm}p{4.6cm}}
+\toprule
+Hypothesis & On buggy (49\% missing) data & On corrected (8\% missing) data \\
+\midrule
+H1 (CoT worsens calibration, sub-3B) & \emph{(reported as confirmed pre-fix)} & \textbf{False} --- sub-3B ECE(CoT)$=0.383 <$ ECE(Direct)$=0.455$ \\
+H2 (CoT worsens consistency, sub-3B) & \emph{(reported as confirmed pre-fix)} & \textbf{False} --- sub-3B mean $\Delta = +0.005$ \\
+H3 (reversal at $\geq$3B, both metrics) & \emph{(reported as confirmed pre-fix)} & \textbf{False} --- ECE actually worsens under CoT at $\geq$3B ($0.240$ vs.\ $0.212$); only the consistency half of H3 holds \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Had we not caught this, we would have published a hypothesis-confirming paper built on an artifact of prompt conflict and storage truncation --- a direct illustration of \citet{schaeffer2023mirage}'s caution that apparent ``emergent'' scaling reversals can be measurement-dependent rather than real. We view this as a stronger contribution than a clean confirmation would have been.
+
+\section{Results}
+
+\subsection{Accuracy (Sanity Check, Not the Main Contribution)}
+\label{sec:results-accuracy}
+
+CoT improves mean accuracy on GSM8K substantially ($0.181 \to 0.632$ direct$\to$CoT, averaged across all 7 models) and has mixed-to-negative effects on BBH ($0.387 \to 0.275$) and TruthfulQA ($0.358 \to 0.251$) --- consistent with CoT helping multi-step arithmetic far more than tasks where the direct answer format is already well-matched to the question (MCQ letter selection). This matches the standard CoT literature and is not itself novel; we report it as a sanity check that our pipeline reproduces expected accuracy trends before trusting it on calibration/consistency (Figure~\ref{fig:fig1}).
+
+Two additional accuracy-scoring bugs were found and fixed post-hoc (\texttt{scripts/rescore\_accuracy.py}, run locally on downloaded results, no rerun required): BBH's parsed prediction was punctuation-stripped while the ground truth was not (false negatives), GSM8K predictions retained a trailing period the ground truth lacked, and TruthfulQA's letter parser was restricted to A--D when 21\% of ground-truth keys extend to A--J. These are corrected in the \texttt{accuracy\_summary.csv} used throughout this paper.
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.95\linewidth]{figures/fig1_accuracy_scaling.png}
+    \caption{Accuracy vs.\ model size, Direct vs.\ CoT, per dataset.}
+    \label{fig:fig1}
+\end{figure}
+
+\subsection{Calibration}
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.95\linewidth]{figures/fig2_ece_scaling.png}
+    \caption{ECE vs.\ model size, Direct vs.\ CoT, per dataset.}
+    \label{fig:fig2}
+\end{figure}
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.95\linewidth]{figures/fig3_reliability_diagrams.png}
+    \caption{Reliability diagrams, 4 representative models, GSM8K.}
+    \label{fig:fig3}
+\end{figure}
+
+Averaged by size class (Table~\ref{tab:calibration}):
+
+\begin{table}[h]
+\centering
+\caption{Calibration (ECE) by size class.}
+\label{tab:calibration}
+\begin{tabular}{lcc}
+\toprule
+Size class & ECE, Direct & ECE, CoT \\
+\midrule
+Sub-3B & 0.455 & \textbf{0.383} \\
+$\geq$3B & 0.212 & 0.240 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+CoT \textbf{improves} calibration for sub-3B models and mildly \textbf{worsens} it for $\geq$3B models --- the opposite pattern from H1's prediction, and inconsistent with H3's predicted reversal (which required CoT to \emph{help} calibration at $\geq$3B, not hurt it).
+
+\subsection{Paraphrase Consistency}
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.8\linewidth]{figures/fig4_consistency_delta.png}
+    \caption{Consistency delta (CoT $-$ Direct) vs.\ model size.}
+    \label{fig:fig4}
+\end{figure}
+
+\begin{table}[h]
+\centering
+\caption{Consistency delta by size class.}
+\label{tab:consistency}
+\begin{tabular}{lc}
+\toprule
+Size class & Mean consistency $\Delta$ (CoT $-$ Direct) \\
+\midrule
+Sub-3B & $+0.005$ ($\sim$no effect) \\
+$\geq$3B & $\mathbf{+0.040}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Here the $\geq$3B half of H3 \emph{does} hold --- CoT measurably improves paraphrase consistency at $\geq$3B ($+0.040$) --- but H2's prediction of a sub-3B \emph{decrease} does not; the sub-3B effect is negligible rather than negative.
+
+\subsection{Synthesis: A Decoupled Pattern, Not a Threshold Reversal}
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.8\linewidth]{figures/fig5_combined_trustworthiness.png}
+    \caption{Combined calibration and consistency view across model scale.}
+    \label{fig:fig5}
+\end{figure}
+
+Putting Sections~\ref{sec:results-accuracy}--\ref{sec:results-accuracy} together (calibration in the ECE table, consistency in the delta table above), the data does not support a single scale threshold at which CoT flips from harmful to helpful across both trust metrics simultaneously. Instead:
+
+\begin{itemize}
+    \item \textbf{Calibration} benefits from CoT specifically at \textbf{small} scale (sub-3B), and that benefit fades (turns slightly negative) at larger scale.
+    \item \textbf{Consistency} benefits from CoT specifically at \textbf{large} scale ($\geq$3B), with negligible effect at small scale.
+\end{itemize}
+
+These two effects move in \emph{opposite} directions across the size axis and do not share a crossover point --- CoT is not ``bad below 3B, good above 3B'' on either metric individually, let alone jointly. We interpret this as evidence that calibration and paraphrase robustness are governed by different underlying mechanisms (verbalized-confidence articulation vs.\ reasoning-path stability) that scale differently with parameter count, rather than by a single ``capacity to reason'' threshold (Figure~\ref{fig:fig5}).
+
+\section{Discussion}
+\label{sec:discussion}
+
+\paragraph{Why did the pre-registered hypotheses fail?} We designed H1--H3 around an intuitive but, in retrospect, oversimplified model: that CoT requires a minimum reasoning capacity to execute correctly, and that below that capacity it would degrade \emph{everything} (accuracy, calibration, consistency) uniformly, with a uniform reversal above it. Our accuracy results alone already complicate this picture --- CoT's accuracy benefit on GSM8K is not threshold-gated; it improves accuracy at every scale we tested, including 0.5B. The calibration/consistency decoupling reported in Section~\ref{sec:results-accuracy} extends this: even the \emph{trust} metrics don't move as a bundle.
+
+\paragraph{Practical implication.} For practitioners deploying sub-3B models where calibrated confidence matters more than paraphrase robustness --- e.g., a small on-device model deciding whether to escalate a query to a larger model, in the style of LLM cascades and learned routers \citep{chen2023frugalgpt,ong2024routellm,ding2024hybridllm} --- our results suggest CoT prompting is a net positive on the metric that matters, contrary to the common assumption that small models ``can't do CoT properly.'' Conversely, for deployments where consistency under rephrasing matters more (e.g., user-facing QA where users don't phrase questions identically), CoT's benefit is concentrated at $\geq$3B and should not be assumed to transfer to smaller models.
+
+\paragraph{Methodological note for the field.} Verbalized-confidence pipelines are fragile to exactly the two failure modes we found: (1) system-prompt instructions that implicitly conflict with an appended elicitation ask, and (2) fixed-size storage truncation silently discarding trailing content in verbose (CoT) outputs. Both failures are silent --- they do not raise errors, they just produce \texttt{NaN}/missing values that look like ``the model didn't know'' rather than ``the pipeline didn't ask correctly'' or ``the pipeline didn't save the answer.'' We recommend the EOS-based cap-hit diagnostic (Section~\ref{sec:bug}) as a cheap addition to any generation pipeline making claims about response completeness.
+
+\section{Limitations}
+
+\begin{itemize}
+    \item \textbf{Scale range.} We test 0.5B--8B; whether the decoupled pattern continues, converges, or reverses again beyond 8B is untested.
+    \item \textbf{Single-run determinism.} All generation is greedy/deterministic; we do not characterize variance from sampling temperature, which could interact with both calibration and consistency.
+    \item \textbf{Residual confidence non-compliance.} The smallest models (0.5B--1B) still exhibit 12--75\% missing verbalized confidence after all fixes (Section~\ref{sec:bug}) --- our calibration numbers for these models rest on a smaller, and potentially non-representative, subset of responses (the ones that \emph{did} comply with the confidence-line instruction). This is disclosed per-combination via $n_{\text{valid}}$ in all calibration figures/tables.
+    \item \textbf{Two calibration datasets only.} GSM8K and TruthfulQA were chosen because BBH answers are too short for meaningful confidence elicitation; the calibration finding does not cover BBH-style tasks.
+    \item \textbf{Paraphrase generation quality.} Consistency depends on the quality of the LLM-generated paraphrases (Step 1) preserving exact question meaning; we did not run a separate human/automatic paraphrase-fidelity check.
+\end{itemize}
+
+\section{Conclusion}
+
+We set out to test whether chain-of-thought prompting has a scale-dependent effect on the trustworthiness (not just accuracy) of language models, pre-registering a specific reversal-at-3B hypothesis. After finding and fixing a confidence-elicitation prompt bug and a response-truncation bug that together produced a 49\% missing-confidence rate --- and that flipped the direction of our primary calibration finding --- none of our three pre-registered hypotheses survive on corrected data. In their place, we report a decoupled pattern: CoT reliably improves calibration at small scale and reliably improves paraphrase consistency at large scale, with no shared crossover threshold. We view the honest negative result, together with the documented measurement pitfalls, as more valuable to the field than a clean but fragile hypothesis confirmation would have been, and release our full pipeline for reproduction.
+
+\section*{Broader Impact Statement}
+
+This work is diagnostic rather than generative: we evaluate existing open-weight models on existing public benchmarks and release no new model weights or data-collection pipeline. The intended positive impact is enabling more informed deployment decisions for small, on-device language models --- e.g., knowing that a sub-3B model's CoT-elicited confidence is comparatively trustworthy could support cheaper, more energy-efficient deployments in place of always defaulting to a larger model. The main risk we see is over-trusting calibration metrics computed on a limited benchmark suite (Section~\ref{sec:bug}, Limitations): a practitioner who reads ``CoT improves calibration below 3B'' without the accompanying caveats about residual confidence non-compliance and benchmark coverage could over-generalize to settings we did not test. No personally identifiable data was used; all benchmarks (GSM8K, BBH, TruthfulQA) are pre-existing public academic datasets.
+
+\begin{ack}
+This work received no external funding. All experiments were run on Kaggle's free-tier 2$\times$T4 GPU allocation (Section~\ref{sec:models}).
+\end{ack}
+
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+\appendix
+
+\section{Full Result Tables}
+\label{sec:app-tables}
+
+\subsection{Accuracy}
+
+\begin{longtable}{lclcr}
+\caption{Full accuracy results (exact match) for all seven models, three benchmarks, and both prompting modes. Corresponds to \texttt{results/accuracy\_summary.csv} after the post-hoc rescoring fixes described in Section~\ref{sec:results-accuracy}.} \label{tab:full-accuracy} \\
+\toprule
+Model & Size (B) & Dataset & Mode & Accuracy \\
+\midrule
+\endhead
+\bottomrule
+\endfoot
+Qwen2.5-0.5B & 0.5 & BBH & Direct & 0.372 \\
+Qwen2.5-0.5B & 0.5 & BBH & CoT & 0.300 \\
+Qwen2.5-0.5B & 0.5 & GSM8K & Direct & 0.280 \\
+Qwen2.5-0.5B & 0.5 & GSM8K & CoT & 0.370 \\
+Qwen2.5-0.5B & 0.5 & TruthfulQA & Direct & 0.130 \\
+Qwen2.5-0.5B & 0.5 & TruthfulQA & CoT & 0.200 \\
+Llama-3.2-1B & 1.0 & BBH & Direct & 0.333 \\
+Llama-3.2-1B & 1.0 & BBH & CoT & 0.122 \\
+Llama-3.2-1B & 1.0 & GSM8K & Direct & 0.150 \\
+Llama-3.2-1B & 1.0 & GSM8K & CoT & 0.405 \\
+Llama-3.2-1B & 1.0 & TruthfulQA & Direct & 0.285 \\
+Llama-3.2-1B & 1.0 & TruthfulQA & CoT & 0.250 \\
+Qwen2.5-1.5B & 1.5 & BBH & Direct & 0.383 \\
+Qwen2.5-1.5B & 1.5 & BBH & CoT & 0.211 \\
+Qwen2.5-1.5B & 1.5 & GSM8K & Direct & 0.190 \\
+Qwen2.5-1.5B & 1.5 & GSM8K & CoT & 0.645 \\
+Qwen2.5-1.5B & 1.5 & TruthfulQA & Direct & 0.335 \\
+Qwen2.5-1.5B & 1.5 & TruthfulQA & CoT & 0.335 \\
+Gemma-2-2B & 2.0 & BBH & Direct & 0.428 \\
+Gemma-2-2B & 2.0 & BBH & CoT & 0.189 \\
+Gemma-2-2B & 2.0 & GSM8K & Direct & 0.065 \\
+Gemma-2-2B & 2.0 & GSM8K & CoT & 0.575 \\
+Gemma-2-2B & 2.0 & TruthfulQA & Direct & 0.360 \\
+Gemma-2-2B & 2.0 & TruthfulQA & CoT & 0.245 \\
+Qwen2.5-3B & 3.0 & BBH & Direct & 0.428 \\
+Qwen2.5-3B & 3.0 & BBH & CoT & 0.439 \\
+Qwen2.5-3B & 3.0 & GSM8K & Direct & 0.150 \\
+Qwen2.5-3B & 3.0 & GSM8K & CoT & 0.820 \\
+Qwen2.5-3B & 3.0 & TruthfulQA & Direct & 0.340 \\
+Qwen2.5-3B & 3.0 & TruthfulQA & CoT & 0.250 \\
+Llama-3.2-3B & 3.0 & BBH & Direct & 0.389 \\
+Llama-3.2-3B & 3.0 & BBH & CoT & 0.217 \\
+Llama-3.2-3B & 3.0 & GSM8K & Direct & 0.140 \\
+Llama-3.2-3B & 3.0 & GSM8K & CoT & 0.755 \\
+Llama-3.2-3B & 3.0 & TruthfulQA & Direct & 0.530 \\
+Llama-3.2-3B & 3.0 & TruthfulQA & CoT & 0.225 \\
+Llama-3.1-8B & 8.0 & BBH & Direct & 0.378 \\
+Llama-3.1-8B & 8.0 & BBH & CoT & 0.450 \\
+Llama-3.1-8B & 8.0 & GSM8K & Direct & 0.290 \\
+Llama-3.1-8B & 8.0 & GSM8K & CoT & 0.855 \\
+Llama-3.1-8B & 8.0 & TruthfulQA & Direct & 0.525 \\
+Llama-3.1-8B & 8.0 & TruthfulQA & CoT & 0.250 \\
+\end{longtable}
+
+\subsection{Calibration}
+
+\begin{footnotesize}
+\begin{longtable}{llcrrrrrr}
+\caption{Full calibration results. ECE uses 10 bins; AUROC treats confidence as a correct/incorrect classifier; AURC is the accuracy--rejection curve area; ``Conf.'' is mean verbalized confidence; $n$ is the number of responses with a parseable confidence value out of 200 (Section~\ref{sec:bug}). Corresponds to \texttt{results/calibration\_ece.csv}. BBH is excluded (Section~\ref{sec:hypotheses}).} \label{tab:full-calibration} \\
+\toprule
+Model & Dataset & Mode & ECE & Brier & AUROC & AURC & Conf. & $n$ \\
+\midrule
+\endhead
+\bottomrule
+\endfoot
+Qwen2.5-0.5B & GSM8K & Direct & 0.673 & 0.637 & 0.197 & 0.992 & 0.713 & 176 \\
+Qwen2.5-0.5B & GSM8K & CoT & 0.606 & 0.635 & 0.518 & 0.843 & 0.809 & 193 \\
+Qwen2.5-0.5B & TruthfulQA & Direct & 0.588 & 0.597 & 0.452 & 0.887 & 0.792 & 49 \\
+Qwen2.5-0.5B & TruthfulQA & CoT & 0.611 & 0.574 & 0.505 & 0.775 & 0.809 & 153 \\
+Llama-3.2-1B & GSM8K & Direct & 0.161 & 0.211 & 0.688 & 0.872 & 0.231 & 175 \\
+Llama-3.2-1B & GSM8K & CoT & 0.268 & 0.408 & 0.523 & 0.651 & 0.494 & 167 \\
+Llama-3.2-1B & TruthfulQA & Direct & 0.098 & 0.066 & 0.500 & 1.000 & 0.098 & 192 \\
+Llama-3.2-1B & TruthfulQA & CoT & 0.338 & 0.418 & 0.471 & 0.755 & 0.474 & 132 \\
+Qwen2.5-1.5B & GSM8K & Direct & 0.818 & 0.752 & 0.131 & 0.993 & 0.836 & 182 \\
+Qwen2.5-1.5B & GSM8K & CoT & 0.097 & 0.566 & 0.574 & 0.547 & 0.961 & 199 \\
+Qwen2.5-1.5B & TruthfulQA & Direct & 0.699 & 0.618 & 0.707 & 0.821 & 0.807 & 167 \\
+Qwen2.5-1.5B & TruthfulQA & CoT & 0.479 & 0.642 & 0.518 & 0.741 & 0.867 & 186 \\
+Gemma-2-2B & GSM8K & Direct & 0.109 & 0.918 & 0.468 & 0.979 & 0.942 & 195 \\
+Gemma-2-2B & GSM8K & CoT & 0.068 & 0.614 & 0.540 & 0.632 & 0.983 & 200 \\
+Gemma-2-2B & TruthfulQA & Direct & 0.497 & 0.628 & 0.513 & 0.666 & 0.969 & 199 \\
+Gemma-2-2B & TruthfulQA & CoT & 0.598 & 0.613 & 0.599 & 0.645 & 0.913 & 200 \\
+Qwen2.5-3B & GSM8K & Direct & 0.199 & 0.806 & 0.570 & 0.868 & 0.957 & 198 \\
+Qwen2.5-3B & GSM8K & CoT & 0.046 & 0.423 & 0.563 & 0.419 & 0.991 & 200 \\
+Qwen2.5-3B & TruthfulQA & Direct & 0.258 & 0.542 & 0.585 & 0.592 & 0.813 & 200 \\
+Qwen2.5-3B & TruthfulQA & CoT & 0.376 & 0.581 & 0.594 & 0.572 & 0.913 & 199 \\
+Llama-3.2-3B & GSM8K & Direct & 0.058 & 0.839 & 0.401 & 0.880 & 0.960 & 198 \\
+Llama-3.2-3B & GSM8K & CoT & 0.017 & 0.405 & 0.530 & 0.404 & 0.992 & 200 \\
+Llama-3.2-3B & TruthfulQA & Direct & 0.262 & 0.465 & 0.524 & 0.655 & 0.571 & 200 \\
+Llama-3.2-3B & TruthfulQA & CoT & 0.409 & 0.536 & 0.459 & 0.715 & 0.818 & 200 \\
+Llama-3.1-8B & GSM8K & Direct & 0.150 & 0.832 & 0.543 & 0.855 & 0.989 & 199 \\
+Llama-3.1-8B & GSM8K & CoT & 0.049 & 0.315 & 0.537 & 0.347 & 0.984 & 200 \\
+Llama-3.1-8B & TruthfulQA & Direct & 0.348 & 0.445 & 0.569 & 0.557 & 0.820 & 200 \\
+Llama-3.1-8B & TruthfulQA & CoT & 0.544 & 0.568 & 0.530 & 0.726 & 0.862 & 195 \\
+\end{longtable}
+\end{footnotesize}
+
+\subsection{Paraphrase Consistency}
+
+\begin{longtable}{lclr}
+\caption{Consistency delta (CoT $-$ Direct) per model and dataset. Corresponds to \texttt{results/consistency\_delta.csv}.} \label{tab:full-consistency} \\
+\toprule
+Model & Size (B) & Dataset & Delta \\
+\midrule
+\endhead
+\bottomrule
+\endfoot
+Qwen2.5-0.5B & 0.5 & GSM8K & $+0.012$ \\
+Qwen2.5-0.5B & 0.5 & TruthfulQA & $-0.027$ \\
+Llama-3.2-1B & 1.0 & GSM8K & $+0.016$ \\
+Llama-3.2-1B & 1.0 & TruthfulQA & $+0.028$ \\
+Qwen2.5-1.5B & 1.5 & GSM8K & $+0.028$ \\
+Qwen2.5-1.5B & 1.5 & TruthfulQA & $-0.017$ \\
+Gemma-2-2B & 2.0 & GSM8K & $+0.007$ \\
+Gemma-2-2B & 2.0 & TruthfulQA & $-0.006$ \\
+Qwen2.5-3B & 3.0 & GSM8K & $+0.050$ \\
+Qwen2.5-3B & 3.0 & TruthfulQA & $+0.100$ \\
+Llama-3.2-3B & 3.0 & GSM8K & $+0.011$ \\
+Llama-3.2-3B & 3.0 & TruthfulQA & $+0.025$ \\
+Llama-3.1-8B & 8.0 & GSM8K & $+0.033$ \\
+Llama-3.1-8B & 8.0 & TruthfulQA & $+0.021$ \\
+\end{longtable}
+
+\section{Prompt Templates}
+\label{sec:app-prompts}
+
+Verbatim system prompts and the confidence-elicitation suffix from \texttt{src/prompts.py}. \texttt{SYSTEM\_DIRECT} and \texttt{SYSTEM\_COT} are used for the accuracy and consistency axes; \texttt{SYSTEM\_DIRECT\_CALIBRATION} and \texttt{SYSTEM\_COT\_CALIBRATION} replace them for the calibration axis specifically, as the fix for Bug 1 in Section~\ref{sec:bug}.
+
+\subsection{Confidence-Elicitation Suffix}
+Appended to the final user message only when building a calibration-axis prompt:
+\begin{verbatim}
+"\nConfidence: <0-100>"
+\end{verbatim}
+
+\subsection{SYSTEM\_DIRECT (accuracy / consistency axes)}
+\begin{verbatim}
+You are a helpful assistant. Answer the question concisely. Give only
+the final answer with no explanation.
+\end{verbatim}
+
+\subsection{SYSTEM\_COT (accuracy / consistency axes)}
+\begin{verbatim}
+You are a helpful assistant. Think step by step before giving your
+final answer. End your response with 'Answer: <your answer>'.
+\end{verbatim}
+
+\subsection{SYSTEM\_DIRECT\_CALIBRATION}
+\begin{verbatim}
+You are a helpful assistant. Give your final answer on the first line.
+Then, on a new line, state your confidence in that answer as
+'Confidence: <0-100>'. Do not skip the confidence line.
+\end{verbatim}
+
+\subsection{SYSTEM\_COT\_CALIBRATION}
+\begin{verbatim}
+You are a helpful assistant. Think step by step before giving your
+final answer. End your response with 'Answer: <your answer>' followed
+by 'Confidence: <0-100>' on the next line. Do not skip the confidence
+line.
+\end{verbatim}
+
+\newpage
+\section*{NeurIPS Paper Checklist}
+
+\begin{enumerate}
+
+\item {\bf Claims}
+    \item[] Question: Do the main claims made in the abstract and introduction accurately reflect the paper's contributions and scope?
+    \item[] Answer: \answerYes{}
+    \item[] Justification: The abstract and introduction state the paper's actual finding --- a decoupled pattern in which CoT reliably improves calibration at small scale and consistency at large scale, with none of the three pre-registered hypotheses (Section~\ref{sec:hypotheses}) surviving on corrected data --- and explicitly scope it to seven open-weight models (0.5B--8B) on three public benchmarks (Section~\ref{sec:models}).
+    \item[] Guidelines: The claims should match theoretical and experimental results and reflect how much the results generalize; aspirational goals are fine if clearly not attained by the paper.
+
+\item {\bf Limitations}
+    \item[] Question: Does the paper discuss the limitations of the work performed by the authors?
+    \item[] Answer: \answerYes{}
+    \item[] Justification: A dedicated Limitations section enumerates the tested scale range (0.5B--8B), single-run/greedy-decoding determinism, residual confidence non-compliance in the smallest models, coverage of only two calibration datasets, and untested paraphrase-generation fidelity.
+    \item[] Guidelines: Authors should reflect on strong assumptions, scope of claims, factors influencing performance, and computational efficiency.
+
+\item {\bf Theory assumptions and proofs}
+    \item[] Question: For each theoretical result, does the paper provide the full set of assumptions and a complete (and correct) proof?
+    \item[] Answer: \answerNA{}
+    \item[] Justification: The paper is purely empirical; it contains no theorems, formal claims, or proofs.
+    \item[] Guidelines: The answer NA means the paper does not include theoretical results.
+
+\item {\bf Experimental result reproducibility}
+    \item[] Question: Does the paper fully disclose all the information needed to reproduce the main experimental results of the paper to the extent that it affects the main claims and/or conclusions of the paper (regardless of whether the code and data are provided or not)?
+    \item[] Answer: \answerYes{}
+    \item[] Justification: Section~\ref{sec:models} specifies all seven models and quantization settings, greedy decoding, the three benchmarks with sample sizes, the confidence-elicitation and paraphrase procedures, and the exact metrics used; Section~\ref{sec:bug} documents the two measurement bugs found and the fixes applied; Appendix~\ref{sec:app-prompts} gives verbatim prompts.
+    \item[] Guidelines: Reproducibility can be accomplished via released code/data or via sufficiently detailed description of the method and experimental setting.
+
+\item {\bf Open access to data and code}
+    \item[] Question: Does the paper provide open access to the data and code, with sufficient instructions to faithfully reproduce the main experimental results, as described in supplemental material?
+    \item[] Answer: \answerYes{}
+    \item[] Justification: Section~\ref{sec:models} states that code, results, and figures are versioned in a public GitHub repository; an anonymized link will accompany the review copy and the de-anonymized link will be included at camera-ready to preserve double-blind review.
+    \item[] Guidelines: Instructions should contain the exact commands/environment needed to reproduce results; anonymized versions should be released at submission time to preserve anonymity.
+
+\item {\bf Experimental setting/details}
+    \item[] Question: Does the paper specify all the training and test details (e.g., data splits, hyperparameters, how they were chosen, type of optimizer, etc.) necessary to understand the results?
+    \item[] Answer: \answerYes{}
+    \item[] Justification: All experiments are zero-shot evaluation (no training/fine-tuning or held-out splits to choose); Section~\ref{sec:models} specifies decoding settings, quantization, benchmark sizes/formats, and Appendix~\ref{sec:app-prompts} gives the exact system prompts used for every condition.
+    \item[] Guidelines: The experimental setting should be presented in the core paper to a level of detail sufficient to appreciate and make sense of the results.
+
+\item {\bf Experiment statistical significance}
+    \item[] Question: Does the paper report error bars suitably and correctly defined or other appropriate information about the statistical significance of the experiments?
+    \item[] Answer: \answerNo{}
+    \item[] Justification: All results are from a single deterministic (greedy-decoding) run per (model, prompting mode, dataset) combination; no seeds, error bars, or significance tests are reported. This is disclosed as a limitation (``Single-run determinism'').
+    \item[] Guidelines: Authors should answer Yes if results are accompanied by error bars, confidence intervals, or significance tests for the experiments supporting the main claims; No/NA is acceptable with justification.
+
+\item {\bf Experiments compute resources}
+    \item[] Question: For each experiment, does the paper provide sufficient information on the computer resources (type of compute workers, memory, time of execution) needed to reproduce the experiments?
+    \item[] Answer: \answerYes{}
+    \item[] Justification: Section~\ref{sec:models} states all experiments ran on Kaggle's free-tier 2$\times$T4 GPU allocation, and Section~\ref{sec:models} (Reproducibility Infrastructure) describes the checkpointed pipeline's session structure (interrupted 12-hour sessions resumed mid-step).
+    \item[] Guidelines: The paper should indicate compute worker type, memory, and per-run/total compute required.
+
+\item {\bf Code of ethics}
+    \item[] Question: Does the research conducted in the paper conform, in every respect, with the NeurIPS Code of Ethics \url{https://neurips.cc/public/EthicsGuidelines}?
+    \item[] Answer: \answerYes{}
+    \item[] Justification: The research evaluates existing open-weight models on existing public academic benchmarks, uses no personally identifiable data, and discloses this explicitly in the Broader Impact Statement.
+    \item[] Guidelines: Authors should confirm review of the Code of Ethics and explain any special circumstances requiring deviation.
+
+\item {\bf Broader impacts}
+    \item[] Question: Does the paper discuss both potential positive societal impacts and negative societal impacts of the work performed?
+    \item[] Answer: \answerYes{}
+    \item[] Justification: The Broader Impact Statement discusses the positive impact (informing cheaper, more energy-efficient small-model deployment decisions) and the risk of over-trusting calibration metrics computed on a limited benchmark suite.
+    \item[] Guidelines: Authors should consider harms from intended use, incorrect results, and misuse, and discuss mitigations where applicable.
+
+\item {\bf Safeguards}
+    \item[] Question: Does the paper describe safeguards that have been put in place for responsible release of data or models that have a high risk for misuse (e.g., pretrained language models, image generators, or scraped datasets)?
+    \item[] Answer: \answerNA{}
+    \item[] Justification: The paper releases no new model weights, no new dataset, and no scraped data; it evaluates existing open-weight models on existing public benchmarks and releases only analysis code and result CSVs.
+    \item[] Guidelines: The answer NA means the paper poses no such risks.
+
+\item {\bf Licenses for existing assets}
+    \item[] Question: Are the creators or original owners of assets (e.g., code, data, models), used in the paper, properly credited and are the license and terms of use explicitly mentioned and properly respected?
+    \item[] Answer: \answerNo{}
+    \item[] Justification: Every model family and benchmark used is cited to its original paper (Section~\ref{sec:models}), but the main text does not separately enumerate each asset's license name or terms of use; all are standard public academic benchmarks and open-weight instruction-tuned model releases, used strictly for read-only zero-shot evaluation.
+    \item[] Guidelines: The name of the license should be included for each asset where possible; No is an acceptable answer and not grounds for rejection.
+
+\item {\bf New assets}
+    \item[] Question: Are new assets introduced in the paper well documented and is the documentation provided alongside the assets?
+    \item[] Answer: \answerNA{}
+    \item[] Justification: The paper introduces no new dataset or model; only analysis/pipeline code and result CSVs are released, which are covered under Open access to data and code above.
+    \item[] Guidelines: The answer NA means the paper does not release new assets.
+
+\item {\bf Crowdsourcing and research with human subjects}
+    \item[] Question: For crowdsourcing experiments and research with human subjects, does the paper include the full text of instructions given to participants and screenshots, if applicable, as well as details about compensation (if any)?
+    \item[] Answer: \answerNA{}
+    \item[] Justification: The paper involves no crowdsourcing or human-subjects research; all data are existing benchmark items and language-model outputs.
+    \item[] Guidelines: The answer NA means the paper does not involve crowdsourcing nor research with human subjects.
+
+\item {\bf Institutional review board (IRB) approvals or equivalent for research with human subjects}
+    \item[] Question: Does the paper describe potential risks incurred by study participants, whether such risks were disclosed to the subjects, and whether Institutional Review Board (IRB) approvals (or an equivalent approval/review based on the requirements of your country or institution) were obtained?
+    \item[] Answer: \answerNA{}
+    \item[] Justification: The paper involves no human subjects research.
+    \item[] Guidelines: The answer NA means the paper does not involve crowdsourcing nor research with human subjects.
+
+\item {\bf Declaration of LLM usage}
+    \item[] Question: Does the paper describe the usage of LLMs if it is an important, original, or non-standard component of the core methods in this research?
+    \item[] Answer: \answerYes{}
+    \item[] Justification: An LLM is used to generate the five paraphrases per question underlying the paraphrase-consistency metric (Section~\ref{sec:models}, Consistency axis) --- an important, non-standard component of the core method; its potential fidelity issues are explicitly flagged as a limitation (``Paraphrase generation quality'').
+    \item[] Guidelines: The answer NA means the core method development does not involve LLMs as any important, original, or non-standard component.
+
+\end{enumerate}
+
+\end{document}

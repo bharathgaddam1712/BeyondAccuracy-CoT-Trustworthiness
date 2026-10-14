@@ -1,0 +1,459 @@
+"""
+Overnight GPU Run — Combined E1 + E3 + E4
+Phase 2: Launch before bed, captures logit-level diagnostics in a single forward pass.
+
+E1 (Logit-Based Calibration): Captures top-1 probability as logit-derived confidence
+E3 (Entropy Dynamics): Records per-token entropy trajectory during generation
+E4 (Filler-CoT Control): Adds a "filler" prompt mode (long but unstructured) to
+    isolate whether calibration improvement comes from reasoning or just response length
+
+Integrates with existing src/ modules:
+  - models.py: MODEL_REGISTRY, ModelConfig, load_model
+  - prompts.py: make_calibration_prompt (for direct/cot), CONFIDENCE_SUFFIX
+  - inference.py: parse_confidence, parse_gsm8k_answer, parse_bbh_answer, parse_truthfulqa_answer
+  - datasets.py: load_all_datasets
+
+Launch: python overnight_gpu_run.py
+  Or:   nohup python overnight_gpu_run.py > overnight_log.txt 2>&1 &
+Estimated time: 8-14 hours on a single T4/4060 GPU
+"""
+
+import torch
+import json
+import numpy as np
+import pandas as pd
+import gc
+import sys
+import traceback
+from pathlib import Path
+from datetime import datetime
+
+# --- Setup paths ---
+PROJECT_ROOT = Path(__file__).parent.resolve()
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.models import MODEL_REGISTRY, load_model
+from src.datasets import load_all_datasets
+from src.inference import (
+    format_messages,
+    parse_confidence,
+    parse_gsm8k_answer,
+    parse_bbh_answer,
+    parse_truthfulqa_answer,
+)
+from src.prompts import SYSTEM_DIRECT, SYSTEM_COT, CONFIDENCE_SUFFIX
+
+RESULTS = PROJECT_ROOT / "results"
+RESULTS.mkdir(exist_ok=True)
+
+# ============================================================
+# E4 — Filler-CoT system prompt (long output, no structured reasoning)
+# ============================================================
+
+SYSTEM_FILLER = (
+    "You are a helpful assistant. Before answering, share your general thoughts "
+    "and associations about the topic. Reflect broadly on what comes to mind, "
+    "then give your final answer. End your response with 'Answer: <your answer>'."
+)
+
+
+# ============================================================
+# Core: Full-diagnostics generation (captures everything in one pass)
+# ============================================================
+
+@torch.no_grad()
+def generate_full_diagnostics(model, tokenizer, messages, max_new_tokens=512):
+    """
+    Single-sample greedy generation that captures:
+    - Full text response
+    - Per-token entropy trajectory (for E3)
+    - Per-token top-1 probability (for E1 logit confidence)
+    - Per-token margin (top1 - top2)
+
+    Returns dict with all diagnostics.
+    """
+    # Build input using the tokenizer's chat template
+    text = format_messages(messages, tokenizer)
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=2048)
+    inputs = {k: v.to(model.device) for k, v in inputs.items()}
+    input_len = inputs["input_ids"].shape[1]
+
+    # Generate with scores for logit analysis
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        temperature=1.0,
+        output_scores=True,
+        return_dict_in_generate=True,
+    )
+
+    # Decode generated text only (exclude input)
+    generated_ids = outputs.sequences[0, input_len:]
+    response_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+
+    # Per-token entropy, top-1 prob, and margin from logit scores
+    entropies = []
+    top1_probs = []
+    margins = []
+
+    for score in outputs.scores:
+        probs = torch.softmax(score[0], dim=-1)
+
+        # Shannon entropy: H = -sum(p * log(p))
+        log_probs = torch.log(probs + 1e-10)
+        entropy = -(probs * log_probs).sum().item()
+        entropies.append(entropy)
+
+        # Top-1 probability
+        sorted_probs, _ = probs.sort(descending=True)
+        top1_probs.append(sorted_probs[0].item())
+
+        # Margin between top-1 and top-2
+        if len(sorted_probs) > 1:
+            margins.append((sorted_probs[0] - sorted_probs[1]).item())
+        else:
+            margins.append(sorted_probs[0].item())
+
+    return {
+        "text": response_text,
+        "entropies": entropies,
+        "top1_probs": top1_probs,
+        "margins": margins,
+        "first_token_entropy": entropies[0] if entropies else None,
+        "mean_entropy": float(np.mean(entropies)) if entropies else None,
+        "mean_top1_prob": float(np.mean(top1_probs)) if top1_probs else None,
+        "mean_margin": float(np.mean(margins)) if margins else None,
+        # Logit-derived confidence for E1: mean top-1 probability → [0, 1]
+        "logit_confidence": float(np.mean(top1_probs)) if top1_probs else None,
+    }
+
+
+# ============================================================
+# Prompt building (extends existing prompts.py for filler mode)
+# ============================================================
+
+def make_filler_prompt(question, dataset, choices=None):
+    """
+    Build filler-CoT prompt: same question format but with SYSTEM_FILLER.
+    Produces long, unstructured output to test length vs reasoning effect.
+    Appends confidence suffix for calibration comparison.
+    """
+    if dataset == "truthfulqa" and choices:
+        choices_str = "\n".join(
+            f"{chr(65 + i)}. {c}" for i, c in enumerate(choices)
+        )
+        content = f"Question: {question}\n{choices_str}"
+    else:
+        content = f"Question: {question}"
+
+    # Append confidence elicitation
+    content += CONFIDENCE_SUFFIX
+
+    return [
+        {"role": "system", "content": SYSTEM_FILLER},
+        {"role": "user", "content": content},
+    ]
+
+
+def make_prompt_for_mode(question, mode, dataset, choices=None):
+    """
+    Unified prompt builder for all three modes.
+    Uses existing prompts.py for direct/cot, custom for filler.
+    """
+    if mode == "filler":
+        return make_filler_prompt(question, dataset, choices)
+    else:
+        # Use existing make_calibration_prompt (which appends confidence suffix)
+        from src.prompts import make_calibration_prompt
+        return make_calibration_prompt(question, mode, dataset, choices)
+
+
+# ============================================================
+# Answer checking
+# ============================================================
+
+def parse_answer(response, dataset):
+    """Route to the correct parser based on dataset."""
+    if dataset == "gsm8k":
+        return parse_gsm8k_answer(response)
+    elif dataset == "bbh":
+        return parse_bbh_answer(response)
+    elif dataset == "truthfulqa":
+        return parse_truthfulqa_answer(response)
+    else:
+        return response.strip() if response else None
+
+
+def check_answer(predicted, gold):
+    """Normalized string comparison."""
+    if predicted is None:
+        return False
+    return str(predicted).strip().lower() == str(gold).strip().lower()
+
+
+# ============================================================
+# Checkpoint / resume helpers
+# ============================================================
+
+def load_checkpoint(csv_path):
+    """Load existing results and return set of completed (model, mode, dataset) keys."""
+    if csv_path.exists():
+        df = pd.read_csv(csv_path)
+        completed = set()
+        for _, row in df.drop_duplicates(subset=["model", "mode", "dataset"]).iterrows():
+            completed.add((row["model"], row["mode"], row["dataset"]))
+        return df, completed
+    return pd.DataFrame(), set()
+
+
+# ============================================================
+# Main experiment loops
+# ============================================================
+
+def run_e1_e3(config, model, tokenizer, all_datasets, checkpoint_csv):
+    """
+    E1 + E3 combined: Run direct + cot modes, capturing logit confidence + entropy.
+    Returns (rows, entropy_traces).
+    """
+    _, completed = load_checkpoint(checkpoint_csv)
+    rows = []
+    entropy_traces = []
+
+    for dataset_name, samples in all_datasets.items():
+        for mode in ["direct", "cot"]:
+            key = (config.name, mode, dataset_name)
+            if key in completed:
+                print(f"    [skip] {dataset_name}/{mode} — already done")
+                continue
+
+            print(f"    {dataset_name}/{mode}: ", end="", flush=True)
+            for i, sample in enumerate(samples):
+                question = sample["question"]
+                gold = sample["answer"]
+                choices = sample.get("choices")  # Only TruthfulQA has this
+
+                messages = make_prompt_for_mode(question, mode, dataset_name, choices)
+
+                try:
+                    result = generate_full_diagnostics(model, tokenizer, messages)
+                except Exception as e:
+                    if i == 0:
+                        print(f"\n      Error on first sample: {e}")
+                    print("E", end="", flush=True)
+                    continue
+
+                # Parse verbalized confidence (returns [0,1] or None)
+                verb_conf = parse_confidence(result["text"])
+
+                # Parse and check answer
+                pred = parse_answer(result["text"], dataset_name)
+                correct = check_answer(pred, gold)
+
+                rows.append({
+                    "model": config.name,
+                    "size_b": config.size_b,
+                    "dataset": dataset_name,
+                    "mode": mode,
+                    "id": sample["id"],
+                    "question_idx": i,
+                    "answer": gold,
+                    "predicted": pred,
+                    "correct": correct,
+                    "verbalized_confidence": verb_conf,
+                    "logit_confidence": round(result["logit_confidence"], 4) if result["logit_confidence"] else None,
+                    "mean_entropy": round(result["mean_entropy"], 4) if result["mean_entropy"] else None,
+                    "first_token_entropy": round(result["first_token_entropy"], 4) if result["first_token_entropy"] else None,
+                    "mean_top1_prob": round(result["mean_top1_prob"], 4) if result["mean_top1_prob"] else None,
+                    "mean_margin": round(result["mean_margin"], 4) if result["mean_margin"] else None,
+                    "response_length": len(result["text"]),
+                })
+
+                # Save entropy trajectory for E3 (first 50 per condition to limit file size)
+                if i < 50:
+                    entropy_traces.append({
+                        "model": config.name,
+                        "size_b": config.size_b,
+                        "dataset": dataset_name,
+                        "mode": mode,
+                        "question_idx": i,
+                        "entropies": [round(e, 4) for e in result["entropies"]],
+                        "top1_probs": [round(p, 4) for p in result["top1_probs"]],
+                    })
+
+                if (i + 1) % 20 == 0:
+                    print(f"{i+1}", end=" ", flush=True)
+            print(f"({len(samples)} done)")
+
+    return rows, entropy_traces
+
+
+def run_e4_filler(config, model, tokenizer, all_datasets, checkpoint_csv):
+    """
+    E4: Filler-CoT condition. Same structure but with unstructured-thinking prompt.
+    Only captures calibration data (no entropy traces needed).
+    """
+    _, completed = load_checkpoint(checkpoint_csv)
+    rows = []
+
+    for dataset_name, samples in all_datasets.items():
+        key = (config.name, "filler", dataset_name)
+        if key in completed:
+            print(f"    [skip] {dataset_name}/filler — already done")
+            continue
+
+        print(f"    {dataset_name}/filler: ", end="", flush=True)
+        for i, sample in enumerate(samples):
+            question = sample["question"]
+            gold = sample["answer"]
+            choices = sample.get("choices")
+
+            messages = make_filler_prompt(question, dataset_name, choices)
+
+            try:
+                result = generate_full_diagnostics(model, tokenizer, messages)
+            except Exception as e:
+                if i == 0:
+                    print(f"\n      Error on first sample: {e}")
+                print("E", end="", flush=True)
+                continue
+
+            verb_conf = parse_confidence(result["text"])
+            pred = parse_answer(result["text"], dataset_name)
+            correct = check_answer(pred, gold)
+
+            rows.append({
+                "model": config.name,
+                "size_b": config.size_b,
+                "dataset": dataset_name,
+                "mode": "filler",
+                "id": sample["id"],
+                "question_idx": i,
+                "answer": gold,
+                "predicted": pred,
+                "correct": correct,
+                "verbalized_confidence": verb_conf,
+                "logit_confidence": round(result["logit_confidence"], 4) if result["logit_confidence"] else None,
+                "mean_entropy": round(result["mean_entropy"], 4) if result["mean_entropy"] else None,
+                "response_length": len(result["text"]),
+            })
+
+            if (i + 1) % 20 == 0:
+                print(f"{i+1}", end=" ", flush=True)
+        print(f"({len(samples)} done)")
+
+    return rows
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def main():
+    start_time = datetime.now()
+    print("=" * 70)
+    print(f"OVERNIGHT GPU RUN — E1 + E3 + E4")
+    print(f"Started: {start_time}")
+    print(f"Device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU (WARNING: will be very slow)'}")
+    if torch.cuda.is_available():
+        vram = torch.cuda.get_device_properties(0).total_memory / 1e9
+        print(f"VRAM: {vram:.1f} GB")
+    print("=" * 70)
+
+    # --- Load datasets ---
+    print("\nLoading datasets...")
+    all_datasets = load_all_datasets(n_gsm8k=200, n_bbh_per_subtask=60, n_truthfulqa=200)
+    for name, samples in all_datasets.items():
+        print(f"  {name}: {len(samples)} samples")
+
+    # --- Output paths ---
+    e1e3_csv = RESULTS / "e1_e3_logit_calibration.csv"
+    e4_csv = RESULTS / "e4_filler_cot.csv"
+    e3_traces_json = RESULTS / "e3_entropy_traces.json"
+
+    # --- Load existing checkpoints ---
+    existing_e1e3, _ = load_checkpoint(e1e3_csv)
+    existing_e4, _ = load_checkpoint(e4_csv)
+
+    all_e1e3_rows = existing_e1e3.to_dict("records") if len(existing_e1e3) > 0 else []
+    all_e4_rows = existing_e4.to_dict("records") if len(existing_e4) > 0 else []
+
+    # Load existing entropy traces
+    all_traces = []
+    if e3_traces_json.exists():
+        with open(e3_traces_json) as f:
+            all_traces = json.load(f)
+
+    if all_e1e3_rows:
+        print(f"\nResuming: {len(all_e1e3_rows)} existing E1/E3 rows, {len(all_e4_rows)} E4 rows")
+
+    # --- Main loop over models ---
+    for config in MODEL_REGISTRY:
+        print(f"\n{'=' * 70}")
+        print(f"MODEL: {config.name} ({config.size_b}B) [HF: {config.hf_id}]")
+        print(f"{'=' * 70}")
+
+        try:
+            model, tokenizer = load_model(config)
+        except Exception as e:
+            print(f"  ✗ FAILED to load model: {e}")
+            traceback.print_exc()
+            continue
+
+        # --- E1 + E3: Direct + CoT with full diagnostics ---
+        print(f"\n  [E1+E3] Logit calibration + entropy trajectories (direct + cot)...")
+        try:
+            rows, traces = run_e1_e3(config, model, tokenizer, all_datasets, e1e3_csv)
+            all_e1e3_rows.extend(rows)
+            all_traces.extend(traces)
+        except Exception as e:
+            print(f"  ✗ E1/E3 failed: {e}")
+            traceback.print_exc()
+
+        # --- E4: Filler-CoT condition ---
+        print(f"\n  [E4] Filler-CoT (long unstructured output)...")
+        try:
+            e4_rows = run_e4_filler(config, model, tokenizer, all_datasets, e4_csv)
+            all_e4_rows.extend(e4_rows)
+        except Exception as e:
+            print(f"  ✗ E4 failed: {e}")
+            traceback.print_exc()
+
+        # --- Free VRAM ---
+        del model, tokenizer
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # --- Checkpoint after each model ---
+        pd.DataFrame(all_e1e3_rows).to_csv(e1e3_csv, index=False)
+        pd.DataFrame(all_e4_rows).to_csv(e4_csv, index=False)
+        with open(e3_traces_json, "w") as f:
+            json.dump(all_traces, f)
+
+        elapsed = datetime.now() - start_time
+        print(f"\n  ✓ Checkpoint saved. Elapsed: {elapsed}")
+        print(f"    E1/E3: {len(all_e1e3_rows)} rows → {e1e3_csv.name}")
+        print(f"    E3 traces: {len(all_traces)} → {e3_traces_json.name}")
+        print(f"    E4: {len(all_e4_rows)} rows → {e4_csv.name}")
+
+    # --- Final summary ---
+    end_time = datetime.now()
+    duration = end_time - start_time
+    print(f"\n{'=' * 70}")
+    print(f"OVERNIGHT RUN COMPLETE")
+    print(f"  Started:  {start_time}")
+    print(f"  Finished: {end_time}")
+    print(f"  Duration: {duration}")
+    print(f"  E1/E3: {e1e3_csv} ({len(all_e1e3_rows)} rows)")
+    print(f"  E3:    {e3_traces_json} ({len(all_traces)} traces)")
+    print(f"  E4:    {e4_csv} ({len(all_e4_rows)} rows)")
+    print(f"{'=' * 70}")
+    print(f"\nNext: Run the Phase 3 analysis scripts:")
+    print(f"  python e1_analysis.py")
+    print(f"  python e3_analysis.py")
+    print(f"  python e4_analysis.py")
+
+
+if __name__ == "__main__":
+    main()

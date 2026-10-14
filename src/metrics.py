@@ -1,185 +1,101 @@
-"""
-Metrics for Paper A — Beyond Accuracy.
-
-Axis 1 (accuracy):     compute_accuracy_by_dataset
-Axis 2 (calibration):  compute_ece (dict: ece + bin_data), compute_brier,
-                       compute_auroc, compute_aurc, compute_calibration_by_model
-Axis 3 (consistency):  compute_consistency, compute_consistency_by_model,
-                       compute_consistency_delta
-"""
-
+"""Canonical metrics. Undefined quantities are NaN, never a fabricated score."""
 import numpy as np
 import pandas as pd
 from sklearn.metrics import roc_auc_score
 
+def validate_pairs(confidences, correctness):
+    p,y=np.asarray(confidences,float),np.asarray(correctness,float)
+    if p.ndim!=1 or y.shape!=p.shape or not len(p):
+        raise ValueError("Expected equally sized nonempty one-dimensional arrays")
+    if not np.isfinite(p).all() or not np.isfinite(y).all():
+        raise ValueError("Apply an explicit common finite mask before computing metrics")
+    if np.any((p<0)|(p>1)) or not np.isin(y,[0,1]).all():
+        raise ValueError("Confidence must be in [0,1], correctness binary")
+    return p,y
 
-# ---------------------------------------------------------------------------
-# Axis 1 — Accuracy
-# ---------------------------------------------------------------------------
+def bin_assignments(p,n_bins=10,strategy="width"):
+    if n_bins<1 or strategy not in ("width","quantile"):raise ValueError("Invalid bins")
+    edges=np.linspace(0,1,n_bins+1) if strategy=="width" else np.unique(np.r_[0.,np.quantile(p,np.linspace(0,1,n_bins+1)),1.])
+    return np.searchsorted(edges[1:-1],p,side="right"),edges
 
-def compute_accuracy_by_dataset(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    df must have columns: model, mode, dataset, correct (bool)
-    Returns one row per (model, mode, dataset) with accuracy, and size_b if present.
-    """
-    agg = df.groupby(["model", "mode", "dataset"])["correct"].mean().reset_index()
-    agg = agg.rename(columns={"correct": "accuracy"})
-    if "size_b" in df.columns:
-        size_lookup = df.groupby("model")["size_b"].first()
-        agg["size_b"] = agg["model"].map(size_lookup)
-    return agg
+def compute_ece(confidences,correctness,n_bins=10,strategy="width"):
+    p,y=validate_pairs(confidences,correctness);ids,edges=bin_assignments(p,n_bins,strategy);rows=[]
+    for i in range(len(edges)-1):
+        mask=ids==i;n=int(mask.sum())
+        if n:rows.append(dict(bin_lo=float(edges[i]),bin_hi=float(edges[i+1]),bin_mid=float((edges[i]+edges[i+1])/2),bin_conf=float(p[mask].mean()),bin_acc=float(y[mask].mean()),bin_count=n))
+    assert sum(b["bin_count"] for b in rows)==len(p)
+    value=sum(b["bin_count"]*abs(b["bin_conf"]-b["bin_acc"]) for b in rows)/len(p)
+    assert value+1e-12>=abs(p.mean()-y.mean())
+    return dict(ece=float(value),bin_data=rows)
 
+def compute_brier(confidences,correctness):
+    p,y=validate_pairs(confidences,correctness);return float(np.mean((p-y)**2))
 
-# ---------------------------------------------------------------------------
-# Axis 2 — Calibration
-# ---------------------------------------------------------------------------
+def compute_auroc(confidences,correctness):
+    p,y=validate_pairs(confidences,correctness)
+    return float(roc_auc_score(y,p)) if len(np.unique(y))==2 else float("nan")
 
-def compute_ece(confidences, correctness, n_bins: int = 10) -> dict:
-    """
-    Standard ECE with equal-width bins.
-    Returns {"ece": float, "bin_data": [{"bin_lo","bin_hi","bin_mid","bin_conf","bin_acc","bin_count"}]}
-    """
-    conf = np.asarray(confidences, dtype=float)
-    corr = np.asarray(correctness, dtype=float)
-    bins = np.linspace(0, 1, n_bins + 1)
-    n = len(conf)
-    ece = 0.0
-    bin_data = []
-    for lo, hi in zip(bins[:-1], bins[1:]):
-        mask = (conf >= lo) & (conf < hi)
-        cnt = int(mask.sum())
-        if cnt == 0:
-            continue
-        acc = float(corr[mask].mean())
-        mean_conf = float(conf[mask].mean())
-        ece += (cnt / n) * abs(acc - mean_conf)
-        bin_data.append({
-            "bin_lo":   float(lo),
-            "bin_hi":   float(hi),
-            "bin_mid":  float((lo + hi) / 2),
-            "bin_conf": mean_conf,
-            "bin_acc":  acc,
-            "bin_count": cnt,
-        })
-    return {"ece": float(ece), "bin_data": bin_data}
-
-
-def compute_brier(confidences, correctness) -> float:
-    """Mean squared error between confidence and binary outcome."""
-    conf = np.asarray(confidences, dtype=float)
-    corr = np.asarray(correctness, dtype=float)
-    return float(np.mean((conf - corr) ** 2))
-
-
-def compute_auroc(confidences, correctness) -> float:
-    """AUC-ROC: can confidence discriminate correct from wrong answers? 0.5 if one class only."""
-    corr = np.asarray(correctness, dtype=float)
-    if len(np.unique(corr)) < 2:
-        return 0.5
-    return float(roc_auc_score(corr, np.asarray(confidences, dtype=float)))
-
-
-def compute_aurc(confidences, correctness) -> float:
-    """Area under the risk-coverage curve (selective prediction). Lower = better."""
-    conf = np.asarray(confidences, dtype=float)
-    corr = np.asarray(correctness, dtype=float)
-    order = np.argsort(conf)[::-1]
-    sorted_correct = corr[order]
-    n = len(sorted_correct)
-    risks = [1.0 - sorted_correct[:k].mean() for k in range(1, n + 1)]
+def compute_aurc(confidences,correctness):
+    """Expected discrete AURC under uniformly random ordering within score ties."""
+    p,y=validate_pairs(confidences,correctness);n_prev,errors_prev,risks=0,0.,[]
+    for score in np.unique(p)[::-1]:
+        outcomes=y[p==score];rate=float(1-outcomes.mean())
+        risks.extend((errors_prev+j*rate)/(n_prev+j) for j in range(1,len(outcomes)+1))
+        n_prev+=len(outcomes);errors_prev+=len(outcomes)*rate
     return float(np.mean(risks))
 
+def murphy_decomposition(confidences,correctness,n_bins=None):
+    """Exact for distinct forecasts. A binned approximation reports its residual."""
+    p,y=validate_pairs(confidences,correctness)
+    ids=np.unique(p,return_inverse=True)[1] if n_bins is None else bin_assignments(p,n_bins)[0]
+    base,rel,res=y.mean(),0.,0.
+    for i in np.unique(ids):
+        mask=ids==i;weight=mask.mean()
+        rel+=weight*(p[mask].mean()-y[mask].mean())**2
+        res+=weight*(y[mask].mean()-base)**2
+    unc=float(base*(1-base));bs=compute_brier(p,y);residual=float(bs-(rel-res+unc))
+    if n_bins is None:assert abs(residual)<1e-10
+    return dict(brier=bs,reliability=float(rel),resolution=float(res),uncertainty=unc,residual=residual,base_rate=float(base))
 
-def compute_calibration_by_model(df: pd.DataFrame, n_bins: int = 10) -> pd.DataFrame:
-    """
-    df must have columns: model, mode, dataset, confidence, correct (rows with
-    confidence=NaN are dropped per-group).
-    Returns one row per (model, mode, dataset) with ece, brier, auroc, aurc,
-    mean_confidence, n_valid, and size_b if present.
-    """
-    rows = []
-    for (model, mode, dataset), grp in df.groupby(["model", "mode", "dataset"]):
-        valid = grp.dropna(subset=["confidence"])
-        if len(valid) == 0:
-            continue
-        conf = valid["confidence"].astype(float).values
-        corr = valid["correct"].astype(int).values
-        ece_res = compute_ece(conf, corr, n_bins=n_bins)
-        row = {
-            "model":           model,
-            "mode":            mode,
-            "dataset":         dataset,
-            "ece":             ece_res["ece"],
-            "brier":           compute_brier(conf, corr),
-            "auroc":           compute_auroc(conf, corr),
-            "aurc":            compute_aurc(conf, corr),
-            "mean_confidence": float(conf.mean()),
-            "n_valid":         len(valid),
-        }
-        if "size_b" in grp.columns:
-            row["size_b"] = grp["size_b"].iloc[0]
+def calibration_metrics(p,y):
+    p,y=validate_pairs(p,y)
+    out=dict(n_valid=len(p),accuracy_valid=float(y.mean()),mean_confidence=float(p.mean()),brier=compute_brier(p,y),auroc=compute_auroc(p,y),aurc=compute_aurc(p,y))
+    for k in (5,10,15,20):out[f"ece_{k}"]=compute_ece(p,y,k)["ece"]
+    out["ece"]=out["ece_10"];out["ece_quantile_10"]=compute_ece(p,y,10,"quantile")["ece"]
+    out.update(murphy_decomposition(p,y));out["binned_brier_residual"]=murphy_decomposition(p,y,10)["residual"]
+    assert out["brier"]<=1-y.mean()+1-p.mean()+1e-12
+    return out
+
+def compute_accuracy_by_dataset(df):
+    return df.groupby(["model","mode","dataset"],as_index=False).agg(accuracy=("correct","mean"),n=("correct","size"))
+
+def compute_calibration_by_model(df,n_bins=10):
+    rows=[]
+    for (m,s,d),g in df.groupby(["model","mode","dataset"]):
+        valid=g[np.isfinite(g.confidence.astype(float))]
+        row=dict(model=m,mode=s,dataset=d,n_total=len(g),confidence_compliance=len(valid)/len(g))
+        if len(valid):row.update(calibration_metrics(valid.confidence,valid.correct.astype(int)))
         rows.append(row)
     return pd.DataFrame(rows)
 
-
-# ---------------------------------------------------------------------------
-# Axis 3 — Consistency
-# ---------------------------------------------------------------------------
-
-def normalize_answer(s: str) -> str:
-    import re, string
-    s = str(s).lower().strip()
-    s = re.sub(r'\b(a|an|the)\b', ' ', s)
-    s = ''.join(c for c in s if c not in string.punctuation)
-    return ' '.join(s.split())
-
-
-def compute_consistency(answers: list) -> float:
-    """Fraction of answer variants matching the plurality answer."""
-    if not answers:
-        return 0.0
-    from collections import Counter
-    counts = Counter(normalize_answer(a) for a in answers)
-    plurality_count = counts.most_common(1)[0][1]
-    return plurality_count / len(answers)
-
-
-def compute_consistency_by_model(df: pd.DataFrame) -> pd.DataFrame:
+def compute_consistency(answers):
+    """All-pairs agreement. Missing answers never agree; singleton is undefined.
+    A(q)=2/[K(K-1)] sum_{i<j} 1[a_i=a_j and both parsed].
+    Inputs must already be normalized by the dataset-specific parser.
     """
-    df must have columns: model, mode, dataset, question_id, predicted
-    Returns one row per (model, mode, dataset) with mean consistency across questions.
-    """
-    rows = []
-    for (model, mode, dataset), grp in df.groupby(["model", "mode", "dataset"]):
-        per_question = grp.groupby("question_id")["predicted"].apply(list)
-        if len(per_question) == 0:
-            continue
-        mean_consistency = float(np.mean([compute_consistency(answers) for answers in per_question]))
-        row = {"model": model, "mode": mode, "dataset": dataset, "consistency": mean_consistency}
-        if "size_b" in grp.columns:
-            row["size_b"] = grp["size_b"].iloc[0]
-        rows.append(row)
+    if len(answers)<2:return float("nan")
+    valid=lambda a:a is not None and not pd.isna(a) and str(a)!=""
+    hits=sum(valid(a) and valid(b) and a==b for i,a in enumerate(answers) for b in answers[i+1:])
+    return float(hits/(len(answers)*(len(answers)-1)/2))
+
+def compute_consistency_by_model(df):
+    rows=[]
+    for (m,s,d),g in df.groupby(["model","mode","dataset"]):
+        values=[compute_consistency(v.predicted.tolist()) for _,v in g.groupby("question_id")]
+        finite=np.array(values)[np.isfinite(values)]
+        rows.append(dict(model=m,mode=s,dataset=d,consistency=float(finite.mean()) if len(finite) else np.nan,n_questions=len(values),n_eligible=len(finite)))
     return pd.DataFrame(rows)
 
-
-def compute_consistency_delta(summary_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    summary_df must have columns: model, mode, dataset, consistency (output of
-    compute_consistency_by_model). Returns one row per (model, dataset) with
-    delta = consistency[cot] - consistency[direct].
-    """
-    rows = []
-    for (model, dataset), grp in summary_df.groupby(["model", "dataset"]):
-        cot_val    = grp[grp["mode"] == "cot"]["consistency"]
-        direct_val = grp[grp["mode"] == "direct"]["consistency"]
-        if len(cot_val) == 0 or len(direct_val) == 0:
-            continue
-        row = {
-            "model":   model,
-            "dataset": dataset,
-            "delta":   float(cot_val.iloc[0] - direct_val.iloc[0]),
-        }
-        if "size_b" in grp.columns:
-            row["size_b"] = grp["size_b"].iloc[0]
-        rows.append(row)
-    return pd.DataFrame(rows)
+def compute_consistency_delta(df):
+    pivot=df.pivot(index=["model","dataset"],columns="mode",values="consistency")
+    return pivot.assign(delta=pivot.cot-pivot.direct)[["delta"]].reset_index()

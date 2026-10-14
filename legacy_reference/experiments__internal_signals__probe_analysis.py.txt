@@ -1,0 +1,402 @@
+"""
+probe_analysis.py
+==================
+Linear probe analysis on extracted internal signals.
+
+Reads results/internal_{model}_{mode}.npz files and computes:
+  - Verbalized AUROC (on emission subset + full set with non-emitters = 0.5)
+  - Logit AUROC (top-1 prob)
+  - P(True) AUROC
+  - Linear probe AUROC (layer sweep + best-layer + last-layer)
+  - Shuffled-label null (sanity check, must be ~0.5)
+  - Bootstrap 95% CIs on all AUROC values
+
+Outputs:
+  results/probe_auroc_summary.csv
+  results/probe_layer_curves.csv
+  figures/fig_probe_vs_verbalized_auroc.png
+  figures/fig_knows_but_cant_say_gap.png
+  figures/fig_layer_curves.png
+"""
+
+import re
+import warnings
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import StratifiedKFold, cross_val_predict
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+
+warnings.filterwarnings("ignore")
+
+ROOT = Path(__file__).resolve().parents[2]
+RESULTS = ROOT / "results"
+ACTIVATIONS = RESULTS / "activations"
+FIGURES = ROOT / "figures"
+FIGURES.mkdir(parents=True, exist_ok=True)
+(RESULTS / "summary").mkdir(parents=True, exist_ok=True)
+
+MODEL_SIZES = {
+    "Qwen2.5-0.5B":  0.5,
+    "Qwen2_5-0_5B":  0.5,
+    "Llama-3.2-1B":  1.0,
+    "Llama-3_2-1B":  1.0,
+    "Qwen2.5-1.5B":  1.5,
+    "Qwen2_5-1_5B":  1.5,
+    "Gemma-2-2B":    2.0,
+    "Gemma-2_2B":    2.0,
+    "Llama-3.2-3B":  3.0,
+    "Llama-3_2-3B":  3.0,
+    "SmolLM2-360M":  0.36,
+    "SmolLM2-1.7B":  1.7,
+    "SmolLM2-1_7B":  1.7,
+}
+
+N_BOOT  = 1000
+N_FOLDS = 5
+SEEDS   = [0, 1, 2]
+
+
+# ── core metrics ─────────────────────────────────────────────────────────────
+
+def clf_pipeline(C=0.5, seed=0):
+    return make_pipeline(
+        StandardScaler(),
+        LogisticRegression(max_iter=2000, C=C, random_state=seed),
+    )
+
+
+def probe_auroc_cv(X: np.ndarray, y: np.ndarray, seed: int = 0) -> float:
+    """5-fold CV AUROC for a linear probe. Returns NaN if class imbalance is too high."""
+    if len(np.unique(y)) < 2 or min(np.bincount(y.astype(int))) < 5:
+        return float("nan")
+    cv  = StratifiedKFold(N_FOLDS, shuffle=True, random_state=seed)
+    clf = clf_pipeline(seed=seed)
+    probs = cross_val_predict(clf, X, y, cv=cv, method="predict_proba")[:, 1]
+    return float(roc_auc_score(y, probs))
+
+
+def bootstrap_ci(scores_fn, n=N_BOOT, seed=0) -> tuple[float, float]:
+    """Bootstrap 95% CI by resampling indices."""
+    rng = np.random.default_rng(seed)
+    boot = [scores_fn(rng) for _ in range(n)]
+    boot = [b for b in boot if not np.isnan(b)]
+    if not boot:
+        return float("nan"), float("nan")
+    return float(np.percentile(boot, 2.5)), float(np.percentile(boot, 97.5))
+
+
+def scalar_auroc(signal: np.ndarray, y: np.ndarray) -> float:
+    """AUROC for a 1-D scalar signal (verbalized conf, logit, p_true)."""
+    mask = np.isfinite(signal)
+    if mask.sum() < 10 or len(np.unique(y[mask])) < 2:
+        return float("nan")
+    return float(roc_auc_score(y[mask], signal[mask]))
+
+
+def scalar_auroc_full(signal: np.ndarray, y: np.ndarray) -> float:
+    """
+    AUROC on the FULL set, treating non-emitters (NaN) as having 0.5 confidence
+    (random / chance prediction).
+    """
+    if len(np.unique(y)) < 2:
+        return float("nan")
+    s = signal.copy()
+    s[~np.isfinite(s)] = 0.5
+    try:
+        return float(roc_auc_score(y, s))
+    except Exception:
+        return float("nan")
+
+
+# ── layer sweep ──────────────────────────────────────────────────────────────
+
+def layer_sweep(H: np.ndarray, y: np.ndarray, seed: int = 0) -> np.ndarray:
+    """Return per-layer probe AUROC. H: [n, L+1, Hdim]."""
+    L = H.shape[1]
+    return np.array([probe_auroc_cv(H[:, l, :], y, seed=seed) for l in range(L)])
+
+
+# ── analysis per file ─────────────────────────────────────────────────────────
+
+def analyse_file(npz_path: Path) -> dict | None:
+    stem   = npz_path.stem                 # e.g. internal_Qwen2_5-0_5B_direct
+    parts  = stem.split("_", 1)[1]         # Qwen2_5-0_5B_direct
+    # mode is the last underscore-separated token
+    mode   = parts.rsplit("_", 1)[-1]
+    model  = parts.rsplit("_", 1)[0]
+
+    d = np.load(npz_path, allow_pickle=False)
+    H       = d["H"].astype(np.float32)    # [n, L+1, Hdim]
+    H_pre   = d["H_pre"].astype(np.float32)
+    y       = d["y"].astype(int)           # [n]
+    verb    = d["verb"].astype(float)      # [n]  NaN where not emitted
+    logit   = d["logit"].astype(float)     # [n]
+    ptrue   = d["ptrue"].astype(float)     # [n]
+
+    n, L_plus1, Hdim = H.shape
+    print(f"\n{model} / {mode}: n={n}, layers={L_plus1}, Hdim={Hdim}, "
+          f"correct={y.sum()} ({y.mean()*100:.1f}%)")
+
+    # ── scalar baselines ──
+    auc_verb_subset = scalar_auroc(verb, y)       # emission subset
+    auc_verb_full   = scalar_auroc_full(verb, y)  # full set (NaN->0.5)
+    auc_logit       = scalar_auroc(logit, y)
+    auc_ptrue       = scalar_auroc(ptrue, y)
+
+    # ── layer sweep (mean over 3 seeds) ──
+    layer_aucs = np.nanmean(
+        [layer_sweep(H,     y, s) for s in SEEDS], axis=0
+    )
+    layer_aucs_pre = np.nanmean(
+        [layer_sweep(H_pre, y, s) for s in SEEDS], axis=0
+    )
+
+    if np.isnan(layer_aucs).all():
+        best_layer_idx = 0
+        auc_probe_best = float("nan")
+        auc_probe_last = float("nan")
+        auc_probe_pre_best = float("nan")
+        auc_null = float("nan")
+        ci_probe = (float("nan"), float("nan"))
+    else:
+        best_layer_idx = int(np.nanargmax(layer_aucs))
+        auc_probe_best = float(np.nanmax(layer_aucs))
+        auc_probe_last = float(layer_aucs[-1])
+        auc_probe_pre_best = float(np.nanmax(layer_aucs_pre)) if not np.isnan(layer_aucs_pre).all() else float("nan")
+
+        # ── shuffled-label null (must be ~0.5) ──
+        rng  = np.random.default_rng(99)
+        y_sh = rng.permutation(y)
+        auc_null = float(np.nanmean(
+            [probe_auroc_cv(H[:, best_layer_idx, :], y_sh, s) for s in SEEDS]
+        ))
+
+        # ── bootstrap CI on best-layer probe ──
+        X_best = H[:, best_layer_idx, :]
+        cv = StratifiedKFold(N_FOLDS, shuffle=True, random_state=0)
+        clf = clf_pipeline(seed=0)
+        cv_probs = cross_val_predict(clf, X_best, y, cv=cv, method="predict_proba")[:, 1]
+
+        def _probe_boot(rng):
+            idx = rng.integers(0, n, n)
+            if len(np.unique(y[idx])) < 2: return float("nan")
+            return roc_auc_score(y[idx], cv_probs[idx])
+
+        ci_probe = bootstrap_ci(_probe_boot)
+
+    def _verb_boot(rng):
+        mask = np.isfinite(verb)
+        if mask.sum() < 10 or len(np.unique(y[mask])) < 2: return float("nan")
+        idx  = rng.integers(0, mask.sum(), mask.sum())
+        yi   = y[mask][idx]; vi = verb[mask][idx]
+        if len(np.unique(yi)) < 2: return float("nan")
+        return roc_auc_score(yi, vi)
+
+    ci_verb  = bootstrap_ci(_verb_boot)
+
+    print(f"  Verbalized   AUROC (subset): {auc_verb_subset:.4f}  "
+          f"95%CI [{ci_verb[0]:.4f},{ci_verb[1]:.4f}]")
+    print(f"  Verbalized   AUROC (full):   {auc_verb_full:.4f}")
+    print(f"  Logit top-1  AUROC:          {auc_logit:.4f}")
+    print(f"  P(True)      AUROC:          {auc_ptrue:.4f}")
+    print(f"  Probe best   AUROC (L{best_layer_idx}): {auc_probe_best:.4f}  "
+          f"95%CI [{ci_probe[0]:.4f},{ci_probe[1]:.4f}]")
+    print(f"  Probe last   AUROC:          {auc_probe_last:.4f}")
+    print(f"  Probe pre-ans best AUROC:    {auc_probe_pre_best:.4f}")
+    print(f"  Null (shuffled-label):       {auc_null:.4f}  <- must be ~0.5")
+
+    return {
+        "model":             model,
+        "mode":              mode,
+        "n":                 n,
+        "n_correct":         int(y.sum()),
+        "n_layers":          L_plus1,
+        "hidden_dim":        Hdim,
+        "auc_verb_subset":   round(auc_verb_subset, 4),
+        "auc_verb_full":     round(auc_verb_full, 4),
+        "auc_logit":         round(auc_logit, 4),
+        "auc_ptrue":         round(auc_ptrue, 4),
+        "auc_probe_best":    round(auc_probe_best, 4),
+        "auc_probe_last":    round(auc_probe_last, 4),
+        "auc_probe_pre":     round(auc_probe_pre_best, 4),
+        "best_layer":        best_layer_idx,
+        "auc_null":          round(auc_null, 4),
+        "ci_probe_lo":       round(ci_probe[0], 4),
+        "ci_probe_hi":       round(ci_probe[1], 4),
+        "ci_verb_lo":        round(ci_verb[0], 4),
+        "ci_verb_hi":        round(ci_verb[1], 4),
+        "layer_aucs":        layer_aucs.tolist(),
+        "layer_aucs_pre":    layer_aucs_pre.tolist(),
+        "model_size":        MODEL_SIZES.get(model, float("nan")),
+    }
+
+
+# ── plotting ──────────────────────────────────────────────────────────────────
+
+def plot_scaling(summary_df: pd.DataFrame):
+    """Fig 1: AUROC vs model size, 4 lines (verbalized/logit/ptrue/probe)."""
+    df = summary_df[summary_df["mode"] == "direct"].dropna(subset=["model_size"])
+    df = df.sort_values("model_size")
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for col, label, marker in [
+        ("auc_verb_subset", "Verbalized (emission subset)", "o"),
+        ("auc_verb_full",   "Verbalized (full set, NaN->0.5)", "s"),
+        ("auc_logit",       "Logit top-1", "^"),
+        ("auc_ptrue",       "P(True)",     "D"),
+        ("auc_probe_best",  "Linear probe (best layer)", "*"),
+    ]:
+        y_vals = df[col].values
+        x_vals = df["model_size"].values
+        mask   = np.isfinite(y_vals)
+        ax.plot(x_vals[mask], y_vals[mask], marker=marker, label=label, linewidth=2)
+
+    ax.axhline(0.5, color="grey", linestyle="--", alpha=0.5, label="Chance (0.5)")
+    ax.set_xlabel("Model Size (B params)")
+    ax.set_ylabel("AUROC")
+    ax.set_title("Correctness Signal: Internal vs Verbalized (Direct Mode)")
+    ax.legend(fontsize=9)
+    ax.set_ylim(0.4, 1.0)
+    plt.tight_layout()
+    plt.savefig(FIGURES / "fig_probe_vs_verbalized_auroc.png", dpi=150)
+    plt.close()
+    print("Saved fig_probe_vs_verbalized_auroc.png")
+
+
+def plot_gap(summary_df: pd.DataFrame):
+    """Fig 2: (probe - verbalized) gap vs scale, with bootstrap CIs."""
+    df = summary_df[summary_df["mode"] == "direct"].dropna(subset=["model_size", "auc_probe_best", "auc_verb_subset"])
+    df = df.sort_values("model_size")
+
+    if df.empty:
+        return
+
+    gap    = df["auc_probe_best"].values - df["auc_verb_subset"].values
+    gap_lo = df["ci_probe_lo"].values    - df["ci_verb_hi"].values
+    gap_hi = df["ci_probe_hi"].values    - df["ci_verb_lo"].values
+    xs     = df["model_size"].values
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.plot(xs, gap, "o-", color="crimson", linewidth=2, label="Probe - Verbalized gap")
+    ax.fill_between(xs, gap_lo, gap_hi, alpha=0.2, color="crimson",
+                    label="95% bootstrap CI")
+    ax.axhline(0, color="grey", linestyle="--", alpha=0.5)
+    ax.set_xlabel("Model Size (B params)")
+    ax.set_ylabel("AUROC gap (probe - verbalized)")
+    ax.set_title('"Knows but Can\'t Say" Gap vs Scale (Direct Mode)')
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig(FIGURES / "fig_knows_but_cant_say_gap.png", dpi=150)
+    plt.close()
+    print("Saved fig_knows_but_cant_say_gap.png")
+
+
+def plot_layer_curves(summary_df: pd.DataFrame, layer_df: pd.DataFrame):
+    """Fig 3: Layer-wise probe AUROC for all models."""
+    df = summary_df[summary_df["mode"] == "direct"].dropna(subset=["model_size"])
+    df = df.sort_values("model_size")
+
+    n_models = len(df)
+    if n_models == 0:
+        return
+
+    fig, axes = plt.subplots(1, n_models, figsize=(4 * n_models, 4), sharey=True)
+    if n_models == 1:
+        axes = [axes]
+
+    for ax, (_, row) in zip(axes, df.iterrows()):
+        m_layers = layer_df[(layer_df["model"] == row["model"]) & (layer_df["mode"] == "direct")].sort_values("layer")
+        layer_aucs = m_layers["auroc"].values
+        layer_pre  = m_layers["auroc_pre"].values
+        L = len(layer_aucs)
+        if L > 0 and np.isfinite(layer_aucs).any():
+            ax.plot(range(L), layer_aucs, "b-",  linewidth=1.5, label="last-token")
+            ax.plot(range(L), layer_pre,  "r--", linewidth=1.2, label="pre-answer",
+                    alpha=0.7)
+            if np.isfinite(row["best_layer"]):
+                ax.axvline(int(row["best_layer"]), color="blue", linestyle=":", alpha=0.4)
+        ax.axhline(0.5, color="grey", linestyle=":", alpha=0.5)
+        ax.set_title(f"{row['model']}\n({row['model_size']}B)", fontsize=9)
+        ax.set_xlabel("Layer")
+        if ax == axes[0]:
+            ax.set_ylabel("Probe AUROC")
+        ax.legend(fontsize=7)
+        ax.set_ylim(0.4, 1.0)
+
+    plt.suptitle("Layer-wise Probe AUROC (Direct Mode)", fontsize=11)
+    plt.tight_layout()
+    plt.savefig(FIGURES / "fig_layer_curves.png", dpi=150)
+    plt.close()
+    print("Saved fig_layer_curves.png")
+
+
+# ── main ─────────────────────────────────────────────────────────────────────
+
+def main():
+    print("=" * 80)
+    print("LINEAR PROBE ANALYSIS -- 'Knows But Can't Say'")
+    print("=" * 80)
+
+    npz_files = sorted(ACTIVATIONS.glob("internal_*.npz"))
+    if not npz_files:
+        npz_files = sorted(RESULTS.glob("internal_*.npz"))
+    if not npz_files:
+        print("No internal_*.npz files found. Run extract_internal_signals.py first.")
+        return
+
+    print(f"Found {len(npz_files)} NPZ files:\n  " +
+          "\n  ".join(f.name for f in npz_files))
+
+    all_results = []
+    layer_rows  = []
+
+    for npz_path in npz_files:
+        result = analyse_file(npz_path)
+        if result is None:
+            continue
+        # Separate out layer curves for a dedicated CSV
+        layer_aucs     = result.pop("layer_aucs")
+        layer_aucs_pre = result.pop("layer_aucs_pre")
+        all_results.append(result)
+        for l, (a, ap) in enumerate(zip(layer_aucs, layer_aucs_pre)):
+            layer_rows.append({
+                "model": result["model"], "mode": result["mode"],
+                "layer": l, "auroc": a, "auroc_pre": ap,
+            })
+
+    summary_df = pd.DataFrame(all_results)
+    layer_df   = pd.DataFrame(layer_rows)
+    summary_df.to_csv(RESULTS / "probe_auroc_summary.csv", index=False)
+    summary_df.to_csv(RESULTS / "summary" / "probe_auroc_summary.csv", index=False)
+    layer_df.to_csv(RESULTS / "probe_layer_curves.csv", index=False)
+    layer_df.to_csv(RESULTS / "summary" / "probe_layer_curves.csv", index=False)
+    print(f"\nSummary saved to results/probe_auroc_summary.csv and results/summary/probe_auroc_summary.csv")
+
+    # ── clean print ──
+    print("\n" + "=" * 90)
+    print("FINAL AUROC TABLE (direct mode)")
+    print("=" * 90)
+    cols = ["model", "model_size", "n", "auc_verb_subset", "auc_verb_full",
+            "auc_logit", "auc_ptrue", "auc_probe_best", "auc_probe_last",
+            "best_layer", "auc_null"]
+    direct = summary_df[summary_df["mode"] == "direct"].sort_values("model_size")
+    if not direct.empty:
+        print(direct[cols].to_string(index=False))
+
+    # ── plot (only if multiple models available) ──
+    if len(summary_df["model"].unique()) >= 2:
+        plot_scaling(summary_df)
+        plot_gap(summary_df)
+        plot_layer_curves(summary_df, layer_df)
+    else:
+        print("Need >= 2 models for scaling figures.")
+
+
+if __name__ == "__main__":
+    main()

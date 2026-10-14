@@ -1,0 +1,25 @@
+name: CPU verification
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install CPU test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy==2.2.6 pandas==2.3.3 scipy==1.16.2 scikit-learn==1.7.2 matplotlib==3.10.6 pytest==8.4.2
+      - name: Check shell syntax
+        run: |
+          for script in run_everything.sh scripts/*.sh; do
+            bash -n "$script"
+          done
+      - name: Run CPU regression tests
+        env:
+          MPLBACKEND: Agg
+        run: python -m pytest -q

@@ -1,0 +1,274 @@
+"""
+E4 Analysis — Filler-CoT vs Structured-CoT Calibration
+Phase 3: Run after overnight_gpu_run.py completes.
+
+Compares three prompt conditions:
+  1. Direct: short, no reasoning
+  2. Filler-CoT: long, unstructured thinking (same length as CoT)
+  3. Structured-CoT: long, step-by-step reasoning
+
+This is THE critical ablation for the paper:
+  If Filler ECE ≈ CoT ECE → calibration benefit is from LENGTH, not reasoning
+  If Filler ECE ≈ Direct ECE → calibration benefit is from REASONING STRUCTURE
+  Either result is interesting and publishable.
+
+Run: python e4_analysis.py
+"""
+
+import pandas as pd
+import numpy as np
+from pathlib import Path
+
+RESULTS = Path("results")
+FIGURES = Path("figures")
+FIGURES.mkdir(exist_ok=True)
+
+MODEL_SIZES = {
+    "Qwen2.5-0.5B": 0.5, "Llama-3.2-1B": 1.0, "Qwen2.5-1.5B": 1.5,
+    "Gemma-2-2B": 2.0, "Qwen2.5-3B": 3.0, "Llama-3.2-3B": 3.0,
+    "Llama-3.1-8B": 8.0,
+}
+
+
+def compute_ece(confidences, outcomes, n_bins=10):
+    """ECE with equal-width bins over [0, 1]."""
+    confs = np.array(confidences, dtype=float)
+    outs = np.array(outcomes, dtype=float)
+    n = len(confs)
+    if n == 0:
+        return None
+
+    bin_edges = np.linspace(0, 1, n_bins + 1)
+    ece = 0.0
+    for i in range(n_bins):
+        if i < n_bins - 1:
+            mask = (confs >= bin_edges[i]) & (confs < bin_edges[i + 1])
+        else:
+            mask = (confs >= bin_edges[i]) & (confs <= bin_edges[i + 1])
+        if mask.sum() == 0:
+            continue
+        ece += (mask.sum() / n) * abs(outs[mask].mean() - confs[mask].mean())
+    return round(ece, 4)
+
+
+def main():
+    # --- Load both CSVs ---
+    e1e3_csv = RESULTS / "e1_e3_logit_calibration.csv"
+    e4_csv = RESULTS / "e4_filler_cot.csv"
+
+    if not e1e3_csv.exists():
+        print(f"ERROR: {e1e3_csv} not found. Run overnight_gpu_run.py first.")
+        return
+    if not e4_csv.exists():
+        print(f"ERROR: {e4_csv} not found. Run overnight_gpu_run.py first.")
+        return
+
+    e1e3 = pd.read_csv(e1e3_csv)   # has mode: "direct", "cot"
+    e4 = pd.read_csv(e4_csv)       # has mode: "filler"
+
+    print(f"Loaded E1/E3: {len(e1e3)} rows (modes: {e1e3['mode'].unique().tolist()})")
+    print(f"Loaded E4:    {len(e4)} rows (modes: {e4['mode'].unique().tolist()})")
+
+    # Combine into one DataFrame
+    # Ensure consistent columns — take intersection
+    common_cols = list(set(e1e3.columns) & set(e4.columns))
+    combined = pd.concat([e1e3[common_cols], e4[common_cols]], ignore_index=True)
+    print(f"Combined: {len(combined)} rows")
+
+    # --- Compute ECE for all three conditions ---
+    print("\n" + "=" * 100)
+    print("E4: IS THE CALIBRATION BENEFIT FROM REASONING OR JUST RESPONSE LENGTH?")
+    print("  Direct = short, no reasoning")
+    print("  Filler = long, unstructured thinking")
+    print("  CoT    = long, structured step-by-step reasoning")
+    print("=" * 100 + "\n")
+
+    # Use verbalized confidence for calibration comparison
+    header = (f"{'Model':20s} | {'Size':>5s} | {'Scale':>6s} | "
+              f"{'Direct ECE':>10s} | {'Filler ECE':>10s} | {'CoT ECE':>10s} | "
+              f"{'Len D':>6s} | {'Len F':>6s} | {'Len C':>6s} | {'Verdict':>20s}")
+    print(header)
+    print("-" * len(header))
+
+    analysis_rows = []
+    models = sorted(combined["model"].unique(), key=lambda m: MODEL_SIZES.get(m, 99))
+
+    for model in models:
+        size = MODEL_SIZES.get(model, 0)
+        scale = "sub-3B" if size < 3 else "≥3B"
+
+        ece_by_mode = {}
+        len_by_mode = {}
+
+        for mode in ["direct", "filler", "cot"]:
+            g = combined[(combined["model"] == model) & (combined["mode"] == mode)]
+            valid = g.dropna(subset=["verbalized_confidence", "correct"])
+
+            if len(valid) > 10:
+                ece_by_mode[mode] = compute_ece(valid["verbalized_confidence"], valid["correct"])
+            else:
+                ece_by_mode[mode] = None
+
+            if "response_length" in g.columns and len(g) > 0:
+                len_by_mode[mode] = int(g["response_length"].mean())
+            else:
+                len_by_mode[mode] = 0
+
+        # Determine verdict
+        d_ece = ece_by_mode.get("direct")
+        f_ece = ece_by_mode.get("filler")
+        c_ece = ece_by_mode.get("cot")
+
+        if d_ece is not None and f_ece is not None and c_ece is not None:
+            # Compare: is filler closer to direct or to cot?
+            filler_to_direct = abs(f_ece - d_ece)
+            filler_to_cot = abs(f_ece - c_ece)
+
+            if filler_to_cot < filler_to_direct and filler_to_cot < 0.02:
+                verdict = "LENGTH effect"
+            elif filler_to_direct < filler_to_cot and filler_to_direct < 0.02:
+                verdict = "REASONING effect"
+            else:
+                verdict = "Mixed / unclear"
+        else:
+            verdict = "Insufficient data"
+
+        d_str = f"{d_ece:.4f}" if d_ece is not None else "N/A"
+        f_str = f"{f_ece:.4f}" if f_ece is not None else "N/A"
+        c_str = f"{c_ece:.4f}" if c_ece is not None else "N/A"
+
+        print(f"{model:20s} | {size:5.1f} | {scale:>6s} | "
+              f"{d_str:>10s} | {f_str:>10s} | {c_str:>10s} | "
+              f"{len_by_mode.get('direct', 0):>6d} | {len_by_mode.get('filler', 0):>6d} | {len_by_mode.get('cot', 0):>6d} | "
+              f"{verdict:>20s}")
+
+        analysis_rows.append({
+            "model": model, "size_b": size, "scale": scale,
+            "ece_direct": d_ece, "ece_filler": f_ece, "ece_cot": c_ece,
+            "len_direct": len_by_mode.get("direct", 0),
+            "len_filler": len_by_mode.get("filler", 0),
+            "len_cot": len_by_mode.get("cot", 0),
+            "verdict": verdict,
+        })
+
+    analysis_df = pd.DataFrame(analysis_rows)
+
+    # --- Accuracy comparison (secondary) ---
+    print("\n" + "-" * 80)
+    print("ACCURACY ACROSS CONDITIONS (secondary check)")
+    print("-" * 80 + "\n")
+
+    print(f"{'Model':20s} | {'Direct Acc':>10s} | {'Filler Acc':>10s} | {'CoT Acc':>10s}")
+    print("-" * 60)
+
+    for model in models:
+        for mode_label, mode in [("Direct", "direct"), ("Filler", "filler"), ("CoT", "cot")]:
+            g = combined[(combined["model"] == model) & (combined["mode"] == mode)]
+            valid = g.dropna(subset=["correct"])
+            if len(valid) > 0:
+                acc = valid["correct"].mean()
+                analysis_df.loc[analysis_df["model"] == model, f"acc_{mode}"] = round(acc, 4)
+
+    # Print accuracy table
+    for model in models:
+        row = analysis_df[analysis_df["model"] == model].iloc[0]
+        d = row.get("acc_direct", "N/A")
+        f = row.get("acc_filler", "N/A")
+        c = row.get("acc_cot", "N/A")
+        d_s = f"{d:.4f}" if isinstance(d, float) else str(d)
+        f_s = f"{f:.4f}" if isinstance(f, float) else str(f)
+        c_s = f"{c:.4f}" if isinstance(c, float) else str(c)
+        print(f"{model:20s} | {d_s:>10s} | {f_s:>10s} | {c_s:>10s}")
+
+    # --- Summary by scale ---
+    print("\n" + "=" * 80)
+    print("SUMMARY BY SCALE GROUP")
+    print("=" * 80)
+
+    for scale in ["sub-3B", "≥3B"]:
+        sg = analysis_df[analysis_df["scale"] == scale]
+        if sg.empty:
+            continue
+        length_count = sum(sg["verdict"] == "LENGTH effect")
+        reasoning_count = sum(sg["verdict"] == "REASONING effect")
+        print(f"\n  {scale} (n={len(sg)}):")
+        print(f"    LENGTH effect: {length_count} models")
+        print(f"    REASONING effect: {reasoning_count} models")
+        print(f"    Mixed/unclear: {len(sg) - length_count - reasoning_count} models")
+
+        if "ece_direct" in sg.columns:
+            means = sg[["ece_direct", "ece_filler", "ece_cot"]].mean()
+            print(f"    Avg ECE: Direct={means.get('ece_direct', 'N/A'):.4f}, "
+                  f"Filler={means.get('ece_filler', 'N/A'):.4f}, "
+                  f"CoT={means.get('ece_cot', 'N/A'):.4f}")
+
+    # --- Generate plot ---
+    try:
+        import matplotlib.pyplot as plt
+
+        fig, ax = plt.subplots(figsize=(12, 6))
+
+        # Group bar chart: Direct / Filler / CoT ECE by model
+        x = np.arange(len(models))
+        width = 0.25
+
+        colors = {"direct": "#4C72B0", "filler": "#DD8452", "cot": "#55A868"}
+        labels = {"direct": "Direct", "filler": "Filler-CoT", "cot": "Structured-CoT"}
+
+        for idx, mode in enumerate(["direct", "filler", "cot"]):
+            col = f"ece_{mode}"
+            values = []
+            for model in models:
+                row = analysis_df[analysis_df["model"] == model]
+                val = row[col].iloc[0] if not row.empty and pd.notna(row[col].iloc[0]) else 0
+                values.append(val)
+
+            ax.bar(x + (idx - 1) * width, values, width,
+                  label=labels[mode], color=colors[mode], alpha=0.85)
+
+        ax.set_xlabel("Model")
+        ax.set_ylabel("ECE (lower = better calibrated)")
+        ax.set_title("E4: Direct vs Filler-CoT vs Structured-CoT Calibration\n"
+                    "If Filler ≈ CoT → length effect | If Filler ≈ Direct → reasoning effect")
+        ax.set_xticks(x)
+        ax.set_xticklabels([f"{m}\n({MODEL_SIZES.get(m, '?')}B)" for m in models],
+                          rotation=45, ha="right", fontsize=9)
+        ax.legend()
+        ax.axhline(y=0, color="gray", linewidth=0.5)
+
+        # Add 3B threshold line
+        threshold_x = None
+        for i, m in enumerate(models):
+            s = MODEL_SIZES.get(m, 0)
+            if s >= 3 and (i == 0 or MODEL_SIZES.get(models[i-1], 0) < 3):
+                threshold_x = i - 0.5
+                break
+        if threshold_x is not None:
+            ax.axvline(x=threshold_x, color="red", linestyle="--", alpha=0.5, label="3B threshold")
+
+        plt.tight_layout()
+        fig_path = FIGURES / "e4_filler_vs_structured_cot.png"
+        plt.savefig(fig_path, dpi=150, bbox_inches="tight")
+        print(f"\nSaved figure: {fig_path}")
+        plt.close()
+
+    except ImportError:
+        print("\n(matplotlib not available — skipping plot)")
+
+    # --- Save ---
+    out_path = RESULTS / "e4_filler_analysis.csv"
+    analysis_df.to_csv(out_path, index=False)
+    print(f"\nSaved: {out_path}")
+
+    print("\n=== INTERPRETATION GUIDE ===")
+    print("LENGTH effect (Filler ≈ CoT, both < Direct):")
+    print("  → Calibration improvement is about having more tokens before")
+    print("    the confidence statement, not about reasoning content")
+    print("REASONING effect (Filler ≈ Direct, CoT < both):")
+    print("  → Even small models extract something useful from structured")
+    print("    reasoning that improves calibration beyond just response length")
+    print("Both results are interesting and publishable!")
+
+
+if __name__ == "__main__":
+    main()

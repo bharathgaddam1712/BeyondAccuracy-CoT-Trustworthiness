@@ -1,0 +1,221 @@
+"""
+e9_shuffled_cot.py — Shuffled-CoT Causal Intervention Experiment
+================================================================
+Ablates logical step coherence while holding token length and vocabulary constant.
+
+Conditions Compared:
+  1. Direct (Short response)
+  2. Structured-CoT (Original logical steps)
+  3. Shuffled-CoT (Same reasoning steps, randomly permuted)
+
+Outputs:
+  - results/e9_shuffled_cot_results.csv
+  - figures/fig_shuffled_vs_structured_cot.png
+"""
+
+import sys
+import re
+import random
+import argparse
+import numpy as np
+import pandas as pd
+import torch
+import matplotlib.pyplot as plt
+from pathlib import Path
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+RESULTS = Path("results")
+FIGURES = Path("figures")
+RESULTS.mkdir(exist_ok=True)
+FIGURES.mkdir(exist_ok=True)
+
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+
+def shuffle_reasoning_trace(cot_text):
+    """Permute intermediate reasoning steps while preserving token volume."""
+    if not isinstance(cot_text, str) or len(cot_text.strip()) == 0:
+        return ""
+    
+    # Split into steps
+    lines = [l.strip() for l in cot_text.split("\n") if len(l.strip()) > 5]
+    if len(lines) <= 2:
+        lines = [s.strip() for s in re.split(r'(?<=[.!?])\s+', cot_text) if len(s.strip()) > 5]
+    
+    if len(lines) <= 2:
+        return cot_text
+    
+    first = lines[0]
+    middle = lines[1:-1]
+    last = lines[-1]
+    
+    random.shuffle(middle)
+    return "\n".join([first] + middle + [last])
+
+def parse_confidence(response: str):
+    m = re.search(r'[Cc]onfidence[:\s]+(\d+)', response)
+    if m:
+        return max(0.0, min(100.0, int(m.group(1)))) / 100.0
+    nums = re.findall(r'\b(\d{1,3})\b', response[-200:])
+    if nums:
+        v = int(nums[-1])
+        if 0 <= v <= 100:
+            return v / 100.0
+    return None
+
+def compute_ece(confidences, outcomes, n_bins=10):
+    confs = np.array(confidences, dtype=float)
+    outs = np.array(outcomes, dtype=float)
+    valid = (~np.isnan(confs)) & (~np.isnan(outs))
+    confs, outs = confs[valid], outs[valid]
+    n = len(confs)
+    if n == 0:
+        return 0.0
+    bin_edges = np.linspace(0, 1, n_bins + 1)
+    ece = 0.0
+    for i in range(n_bins):
+        mask = (confs >= bin_edges[i]) & (confs <= bin_edges[i+1] if i == n_bins-1 else confs < bin_edges[i+1])
+        if mask.sum() == 0:
+            continue
+        ece += (mask.sum() / n) * abs(outs[mask].mean() - confs[mask].mean())
+    return round(float(ece), 4)
+
+def run_shuffled_inference(model_name="Qwen2.5-0.5B", hf_id="Qwen/Qwen2.5-0.5B-Instruct", sample_limit=150):
+    print(f"\n[E9 Inference] Loading {model_name} onto GPU...")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    tokenizer = AutoTokenizer.from_pretrained(hf_id, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        hf_id,
+        torch_dtype=torch.float16,
+        trust_remote_code=True
+    ).to(device)
+    model.eval()
+    print(f"[E9 Inference] Model loaded on {device}.")
+
+    calib_df = pd.read_csv(RESULTS / "calibration_raw.csv")
+    cot_subset = calib_df[(calib_df["model"] == model_name) & (calib_df["mode"] == "cot")].dropna(subset=["raw_response"]).head(sample_limit)
+
+    print(f"[E9 Inference] Running evaluation on {len(cot_subset)} shuffled traces...")
+    
+    results = []
+    for idx, (_, row) in enumerate(cot_subset.iterrows()):
+        if idx % 25 == 0 and idx > 0:
+            print(f"  Processed {idx}/{len(cot_subset)} questions...")
+
+        orig_trace = str(row["raw_response"])
+        shuffled_trace = shuffle_reasoning_trace(orig_trace)
+        
+        # Build continuation prompt
+        prompt_content = (
+            f"Here is a reasoning trace for a question:\n{shuffled_trace}\n\n"
+            f"Question: {row['id']}\n"
+            f"Based on the thinking above, what is the final answer? Answer concisely.\n"
+            f"Confidence: <0-100>\nAnswer:"
+        )
+
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant. Give your final answer and confidence."},
+            {"role": "user", "content": prompt_content}
+        ]
+
+        try:
+            input_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            inputs = tokenizer(input_text, return_tensors="pt", truncation=True, max_length=2048).to(device)
+            input_len = inputs["input_ids"].shape[1]
+
+            with torch.no_grad():
+                out = model.generate(
+                    **inputs,
+                    max_new_tokens=128,
+                    do_sample=False,
+                    pad_token_id=tokenizer.eos_token_id
+                )
+            
+            gen_text = tokenizer.decode(out[0][input_len:], skip_special_tokens=True).strip()
+            conf = parse_confidence(gen_text)
+            
+            # Simple answer matching against gold
+            gold = str(row["answer"]).strip().lower()
+            pred_match = gold in gen_text.lower()
+
+            results.append({
+                "model": model_name,
+                "dataset": row["dataset"],
+                "id": row["id"],
+                "gold_answer": row["answer"],
+                "original_correct": row["correct"],
+                "original_confidence": row["confidence"],
+                "shuffled_correct": pred_match,
+                "shuffled_confidence": conf if conf is not None else 0.5,
+                "response_text": gen_text[:200]
+            })
+        except Exception as e:
+            pass
+
+    res_df = pd.DataFrame(results)
+    out_csv = RESULTS / f"e9_shuffled_cot_{model_name}.csv"
+    res_df.to_csv(out_csv, index=False)
+    print(f"\n[E9 Inference] Results saved to: {out_csv}")
+
+    # Compute comparative metrics
+    orig_acc = res_df["original_correct"].mean()
+    shuf_acc = res_df["shuffled_correct"].mean()
+    orig_ece = compute_ece(res_df["original_confidence"], res_df["original_correct"])
+    shuf_ece = compute_ece(res_df["shuffled_confidence"], res_df["shuffled_correct"])
+
+    print("\n" + "=" * 70)
+    print(f"SHUFFLED-CoT ABLATION RESULTS — {model_name}")
+    print("=" * 70)
+    print(f"{'Metric':25s} | {'Structured-CoT':>16s} | {'Shuffled-CoT':>16s}")
+    print("-" * 70)
+    print(f"{'Task Accuracy':25s} | {orig_acc*100:15.1f}% | {shuf_acc*100:15.1f}%")
+    print(f"{'Calibration (ECE)':25s} | {orig_ece:16.4f} | {shuf_ece:16.4f}")
+    print("=" * 70)
+
+    # Plot
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(9, 4))
+    ax1.bar(["Structured-CoT", "Shuffled-CoT"], [orig_acc*100, shuf_acc*100], color=["#2b5c8f", "#d95f02"], width=0.5)
+    ax1.set_ylabel("Accuracy (%)")
+    ax1.set_title("Accuracy Impact (Logical Order)")
+    ax1.grid(axis='y', alpha=0.3)
+
+    ax2.bar(["Structured-CoT", "Shuffled-CoT"], [orig_ece, shuf_ece], color=["#2b5c8f", "#d95f02"], width=0.5)
+    ax2.set_ylabel("Expected Calibration Error (ECE)")
+    ax2.set_title("Calibration Impact (Token Length vs Order)")
+    ax2.grid(axis='y', alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(FIGURES / f"fig_shuffled_cot_{model_name}.png", dpi=300)
+    print(f"Saved plot to: figures/fig_shuffled_cot_{model_name}.png\n")
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--run_inference", action="store_true", help="Run local GPU inference on shuffled CoT traces")
+    parser.add_argument("--model", type=str, default="Qwen2.5-0.5B", help="Model name to evaluate")
+    parser.add_argument("--hf_id", type=str, default="Qwen/Qwen2.5-0.5B-Instruct", help="HuggingFace model ID")
+    parser.add_argument("--limit", type=int, default=150, help="Number of samples to evaluate")
+    args = parser.parse_args()
+
+    print("=" * 85)
+    print("EXPERIMENT E9: SHUFFLED-CoT CAUSAL INTERVENTION")
+    print("=" * 85)
+
+    if args.run_inference:
+        run_shuffled_inference(args.model, args.hf_id, args.limit)
+    else:
+        calib_df = pd.read_csv(RESULTS / "calibration_raw.csv")
+        cot_samples = calib_df[calib_df["mode"] == "cot"].dropna(subset=["raw_response", "confidence"]).copy()
+        print(f"Loaded {len(cot_samples)} CoT samples across {cot_samples['model'].nunique()} models.")
+        print("\nDemonstrating step shuffling on sample trace:")
+        sample_text = cot_samples["raw_response"].iloc[0]
+        print("\n--- ORIGINAL TRACE ---")
+        print(sample_text[:300])
+        print("\n--- SHUFFLED TRACE (Same tokens, disrupted logical order) ---")
+        print(shuffle_reasoning_trace(sample_text)[:300])
+        print("\nTo run model evaluation across shuffled traces, execute:")
+        print("python e9_shuffled_cot.py --run_inference")
+
+if __name__ == "__main__":
+    main()

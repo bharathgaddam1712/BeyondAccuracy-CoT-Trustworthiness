@@ -1,0 +1,105 @@
+"""
+e7_e8_analysis.py — Multi-Model & Multi-Dataset Scaling Analysis
+================================================================
+Combines:
+  1. Original 7 models (Qwen2.5 0.5B-3B, Llama3.2 1B-3B, Gemma-2 2B, Llama3.1 8B)
+     on GSM8K, BBH, TruthfulQA
+  2. New 4 models (SmolLM2 360M, SmolLM2 1.7B, Phi-3-mini 3.8B, Phi-3.5-mini 3.8B)
+     on ARC-Challenge (Science) and HellaSwag (Commonsense)
+
+Outputs:
+  - Combined scaling curve plots
+  - Multi-family threshold comparison
+"""
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+RESULTS = Path("results")
+FIGURES = Path("figures")
+FIGURES.mkdir(exist_ok=True)
+
+# 1. Load original data
+orig_calib = pd.read_csv(RESULTS / "calibration_ece.csv")
+orig_acc = pd.read_csv(RESULTS / "accuracy_summary.csv")
+
+# 2. Load E7/E8 data
+e7_calib = pd.read_csv(RESULTS / "calibration_ece_e7_e8.csv")
+e7_acc = pd.read_csv(RESULTS / "accuracy_summary_e7_e8.csv")
+
+# Combine
+all_calib = pd.concat([orig_calib, e7_calib], ignore_index=True)
+all_acc = pd.concat([orig_acc, e7_acc], ignore_index=True)
+
+print("=" * 80)
+print(f"COMBINED DATASET: {all_calib['model'].nunique()} UNIQUE MODELS ACROSS 5 BENCHMARKS")
+print("=" * 80)
+print(f"Models: {sorted(all_calib['model'].unique())}")
+print(f"Datasets: {sorted(all_calib['dataset'].unique())}")
+
+# ECE delta (CoT - Direct) per model & dataset
+ece_deltas = []
+for (model, size_b, dataset), g in all_calib.groupby(["model", "size_b", "dataset"]):
+    cot_rows = g[g["mode"] == "cot"]
+    dir_rows = g[g["mode"] == "direct"]
+    if len(cot_rows) > 0 and len(dir_rows) > 0:
+        c_ece = cot_rows["ece"].values[0]
+        d_ece = dir_rows["ece"].values[0]
+        ece_deltas.append({
+            "model": model,
+            "size_b": size_b,
+            "dataset": dataset,
+            "ece_direct": d_ece,
+            "ece_cot": c_ece,
+            "ece_delta": c_ece - d_ece, # Negative means CoT improved calibration
+            "scale_group": "sub-3B" if size_b < 3.0 else ">=3B"
+        })
+
+delta_df = pd.DataFrame(ece_deltas)
+print("\n" + "=" * 80)
+print("ECE DELTAS (CoT - Direct): Negative = CoT Improved Calibration")
+print("=" * 80)
+print(delta_df.sort_values("size_b").to_string(index=False))
+
+# Group by scale group
+print("\n" + "=" * 80)
+print("AVERAGE ECE DELTA BY SCALE GROUP ACROSS ALL 11 MODELS & 5 BENCHMARKS")
+print("=" * 80)
+summary = delta_df.groupby("scale_group")["ece_delta"].agg(["mean", "std", "count"])
+print(summary)
+
+# Plot Scaling of ECE & Accuracy
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+# Plot 1: Accuracy Scaling
+for dataset in all_acc["dataset"].unique():
+    d_sub = all_acc[(all_acc["dataset"] == dataset) & (all_acc["mode"] == "cot")].sort_values("size_b")
+    ax1.plot(d_sub["size_b"], d_sub["accuracy"], marker='o', label=dataset)
+
+ax1.set_xscale("log")
+ax1.set_xlabel("Model Size (Billion Parameters)")
+ax1.set_ylabel("Accuracy (CoT)")
+ax1.set_title("Accuracy Scaling Across 5 Benchmarks (11 Models)")
+ax1.axvline(x=3.0, color='gray', linestyle='--', alpha=0.7, label='3B Threshold')
+ax1.legend()
+ax1.grid(True, alpha=0.3)
+
+# Plot 2: ECE Delta Scaling
+for dataset in delta_df["dataset"].unique():
+    d_sub = delta_df[delta_df["dataset"] == dataset].sort_values("size_b")
+    ax2.scatter(d_sub["size_b"], d_sub["ece_delta"], s=70, label=dataset)
+
+ax2.axhline(0, color='black', linestyle='-', alpha=0.4)
+ax2.axvline(x=3.0, color='gray', linestyle='--', alpha=0.7, label='3B Threshold')
+ax2.set_xscale("log")
+ax2.set_xlabel("Model Size (Billion Parameters)")
+ax2.set_ylabel("ECE Delta (CoT - Direct)")
+ax2.set_title("CoT Calibration Benefit (Negative = CoT Helps)")
+ax2.legend()
+ax2.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig(FIGURES / "fig_e7_e8_11models_scaling.png", dpi=300)
+print(f"\nSaved combined scaling figure to: figures/fig_e7_e8_11models_scaling.png")

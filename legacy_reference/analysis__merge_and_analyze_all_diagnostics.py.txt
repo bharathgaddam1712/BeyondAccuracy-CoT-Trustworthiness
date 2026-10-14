@@ -1,0 +1,166 @@
+"""
+merge_and_analyze_all_diagnostics.py
+====================================
+Merges:
+  1. Local E1/E3/E4 data (Qwen2.5-0.5B, Qwen2.5-1.5B)
+  2. Kaggle Gated E1/E3/E4 data (Llama-3.2-1B, Gemma-2-2B, Llama-3.2-3B)
+
+Computes across the full scale (0.5B -> 3.0B):
+  - E4: Direct vs Filler-CoT vs Structured-CoT
+  - CoT Reasoning Utility (CRU) Index
+  - Paired Bootstrap Tests (N=10,000)
+  - E3: Token Entropy Slope comparison (Sub-3B vs 3B)
+  - CRU vs Model Size Curve Plot
+"""
+
+import json
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
+from scipy.stats import linregress
+
+RESULTS = Path("results")
+RESULTS_GATED = Path("results_gated")
+FIGURES = Path("figures")
+FIGURES.mkdir(exist_ok=True)
+
+# 1. Merge E1/E3
+df1_local = pd.read_csv(RESULTS / "e1_e3_logit_calibration.csv")
+df1_gated = pd.read_csv(RESULTS_GATED / "e1_e3_logit_calibration_gated.csv")
+all_e1e3 = pd.concat([df1_local, df1_gated], ignore_index=True).drop_duplicates(subset=["model", "dataset", "mode", "id"])
+all_e1e3.to_csv(RESULTS / "master_e1_e3_logit_calibration.csv", index=False)
+
+# 2. Merge E4
+df4_local = pd.read_csv(RESULTS / "e4_filler_cot.csv")
+df4_gated = pd.read_csv(RESULTS_GATED / "e4_filler_cot_gated.csv")
+all_e4 = pd.concat([df4_local, df4_gated], ignore_index=True).drop_duplicates(subset=["model", "dataset", "mode", "id"])
+all_e4.to_csv(RESULTS / "master_e4_filler_cot.csv", index=False)
+
+# 3. Merge Traces
+traces = []
+if (RESULTS / "e3_entropy_traces.json").exists():
+    with open(RESULTS / "e3_entropy_traces.json") as f:
+        traces.extend(json.load(f))
+if (RESULTS_GATED / "e3_entropy_traces_gated.json").exists():
+    with open(RESULTS_GATED / "e3_entropy_traces_gated.json") as f:
+        traces.extend(json.load(f))
+with open(RESULTS / "master_e3_entropy_traces.json", "w") as f:
+    json.dump(traces, f)
+
+print("=" * 95)
+print(f"MASTER DATASET CREATED: {all_e1e3['model'].nunique()} MODELS EVALUATED ACROSS E1, E3, E4")
+print("=" * 95)
+print(f"Models: {sorted(all_e1e3['model'].unique())}")
+print(f"Total E1/E3 Rows: {len(all_e1e3)} | Total E4 Rows: {len(all_e4)} | Total Traces: {len(traces)}")
+
+# Helper metrics
+def compute_ece(confidences, outcomes, n_bins=10):
+    confs = np.array(confidences, dtype=float)
+    outs = np.array(outcomes, dtype=float)
+    n = len(confs)
+    if n == 0:
+        return 0.0
+    bin_edges = np.linspace(0, 1, n_bins + 1)
+    ece = 0.0
+    for i in range(n_bins):
+        mask = (confs >= bin_edges[i]) & (confs <= bin_edges[i+1] if i == n_bins-1 else confs < bin_edges[i+1])
+        if mask.sum() == 0:
+            continue
+        ece += (mask.sum() / n) * abs(outs[mask].mean() - confs[mask].mean())
+    return round(float(ece), 4)
+
+def paired_bootstrap_test(metric_a, metric_b, n_boot=10000, seed=42):
+    np.random.seed(seed)
+    a = np.array(metric_a, dtype=float)
+    b = np.array(metric_b, dtype=float)
+    valid = (~np.isnan(a)) & (~np.isnan(b))
+    a, b = a[valid], b[valid]
+    if len(a) < 5:
+        return {"observed_diff": np.nan, "p_value": np.nan, "ci_95": (np.nan, np.nan)}
+    diffs = a - b
+    observed_diff = float(np.mean(diffs))
+    boot_diffs = [np.mean(np.random.choice(diffs, size=len(diffs), replace=True)) for _ in range(n_boot)]
+    boot_diffs = np.array(boot_diffs)
+    p = float(np.mean(np.abs(boot_diffs - np.mean(boot_diffs)) >= abs(observed_diff)))
+    ci_lo, ci_hi = np.percentile(boot_diffs, [2.5, 97.5])
+    return {"observed_diff": round(observed_diff, 4), "p_value": round(p, 4), "ci_95": (round(float(ci_lo), 4), round(float(ci_hi), 4))}
+
+# 4. Compute Comprehensive E4 & CRU Table
+model_sizes = {
+    "Qwen2.5-0.5B": 0.5,
+    "Llama-3.2-1B": 1.0,
+    "Qwen2.5-1.5B": 1.5,
+    "Gemma-2-2B": 2.0,
+    "Llama-3.2-3B": 3.0,
+}
+
+cru_results = []
+print("\n" + "-" * 95)
+print("E4: COMPLETE CROSS-SCALE COMPARISON & CoT REASONING UTILITY (CRU)")
+print("-" * 95)
+print(f"{'Model':15s} | {'Size':>4s} | {'Direct ECE':>10s} | {'Filler ECE':>10s} | {'CoT ECE':>10s} | {'CRU Index':>10s} | {'Filler vs CoT (p)':>18s} | {'Interpretation':>15s}")
+print("-" * 95)
+
+for model, size_b in sorted(model_sizes.items(), key=lambda x: x[1]):
+    d_data = all_e1e3[(all_e1e3["model"] == model) & (all_e1e3["mode"] == "direct")].dropna(subset=["verbalized_confidence", "correct"])
+    c_data = all_e1e3[(all_e1e3["model"] == model) & (all_e1e3["mode"] == "cot")].dropna(subset=["verbalized_confidence", "correct"])
+    f_data = all_e4[(all_e4["model"] == model) & (all_e4["mode"] == "filler")].dropna(subset=["verbalized_confidence", "correct"])
+
+    common_ids = set(d_data["id"]) & set(c_data["id"]) & set(f_data["id"])
+    if len(common_ids) < 10:
+        continue
+
+    d_sub = d_data[d_data["id"].isin(common_ids)].sort_values("id")
+    c_sub = c_data[c_data["id"].isin(common_ids)].sort_values("id")
+    f_sub = f_data[f_data["id"].isin(common_ids)].sort_values("id")
+
+    ece_d = compute_ece(d_sub["verbalized_confidence"], d_sub["correct"])
+    ece_f = compute_ece(f_sub["verbalized_confidence"], f_sub["correct"])
+    ece_c = compute_ece(c_sub["verbalized_confidence"], c_sub["correct"])
+
+    # CRU = (ECE_filler - ECE_cot) / (ECE_direct - ECE_cot)
+    denom = ece_d - ece_c
+    cru = (ece_f - ece_c) / denom if abs(denom) > 1e-4 else 0.0
+
+    err_f = np.abs(f_sub["verbalized_confidence"].values - f_sub["correct"].values)
+    err_c = np.abs(c_sub["verbalized_confidence"].values - c_sub["correct"].values)
+    test_res = paired_bootstrap_test(err_f, err_c)
+
+    verdict = "Length Effect" if cru < 0.5 else "Reasoning Dominates"
+
+    cru_results.append({
+        "model": model,
+        "size_b": size_b,
+        "ece_direct": ece_d,
+        "ece_filler": ece_f,
+        "ece_cot": ece_c,
+        "cru": cru,
+        "p_value": test_res["p_value"],
+        "ci_95": test_res["ci_95"]
+    })
+
+    print(f"{model:15s} | {size_b:4.1f} | {ece_d:10.4f} | {ece_f:10.4f} | {ece_c:10.4f} | {cru:10.3f} | p={test_res['p_value']:<6.4f} | {verdict:>15s}")
+
+cru_df = pd.DataFrame(cru_results)
+cru_df.to_csv(RESULTS / "master_cru_summary.csv", index=False)
+
+# 5. Plot CRU vs Model Scale
+fig, ax = plt.subplots(figsize=(8, 5))
+ax.plot(cru_df["size_b"], cru_df["cru"], marker='o', color='purple', linewidth=2.5, markersize=8, label='CoT Reasoning Utility (CRU)')
+ax.axhline(0.0, color='blue', linestyle='--', alpha=0.6, label='CRU=0 (Pure Length / Formatting)')
+ax.axhline(1.0, color='green', linestyle='--', alpha=0.6, label='CRU=1 (Pure Reasoning Content)')
+ax.axvline(3.0, color='gray', linestyle=':', alpha=0.8, label='3B Emergence Threshold')
+
+ax.set_xscale("log")
+ax.set_xticks([0.5, 1.0, 1.5, 2.0, 3.0])
+ax.get_xaxis().set_major_formatter(plt.ScalarFormatter())
+ax.set_xlabel("Model Parameter Scale (Billion Parameters)", fontsize=11)
+ax.set_ylabel("CoT Reasoning Utility (CRU Index)", fontsize=11)
+ax.set_title("Quantifying the Transition: Length Effect to Reasoning Dominance", fontsize=12, pad=12)
+ax.legend(frameon=True)
+ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig(FIGURES / "fig_cru_scaling_transition.png", dpi=300)
+print(f"\nSaved CRU Scaling Curve figure to: figures/fig_cru_scaling_transition.png")

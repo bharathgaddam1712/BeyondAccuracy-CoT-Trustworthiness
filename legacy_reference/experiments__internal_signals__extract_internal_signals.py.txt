@@ -1,0 +1,354 @@
+"""
+extract_internal_signals.py — ULTRA-STABLE HIGH-PERFORMANCE EXTRACTION
+======================================================================
+Architecture:
+  1. Load-Once: Model loaded once per model, processes all modes before teardown.
+  2. Memory-Safe Adaptive Batching:
+     - Direct mode (64 tokens): batch_size = 4
+     - CoT / Filler mode (384 tokens): batch_size = 2
+  3. Single Forward Pass for Hidden States: Avoids holding 384 step tuples in VRAM.
+  4. Automatic Memory Management & OOM Recovery.
+  5. Real-Time progress logging with flush=True.
+"""
+
+import argparse
+import gc
+import re
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn.functional as F
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+# Enable TF32 for RTX 40-series Tensor Cores
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+from src.datasets import load_gsm8k
+
+RESULTS = ROOT / "results"
+ACTIVATIONS = RESULTS / "activations"
+ACTIVATIONS.mkdir(parents=True, exist_ok=True)
+
+MODEL_REGISTRY = {
+    "Qwen2.5-0.5B":  "Qwen/Qwen2.5-0.5B-Instruct",
+    "Llama-3.2-1B":  "meta-llama/Llama-3.2-1B-Instruct",
+    "Qwen2.5-1.5B":  "Qwen/Qwen2.5-1.5B-Instruct",
+    "Gemma-2-2B":    "google/gemma-2-2b-it",
+    "Llama-3.2-3B":  "meta-llama/Llama-3.2-3B-Instruct",
+}
+
+SYSTEM_PROMPTS = {
+    "direct": (
+        "You are a helpful math assistant. Provide the final answer directly "
+        "with no explanation. End with 'Answer: <your answer>'."
+    ),
+    "cot": (
+        "You are a helpful math assistant. Think step-by-step to solve the problem. "
+        "End with 'Answer: <your answer>'."
+    ),
+    "filler": (
+        "You are a helpful assistant. Before answering, share your general thoughts "
+        "and associations about the topic. Reflect broadly on what comes to mind, "
+        "then give your final answer. End your response with 'Answer: <your answer>'."
+    ),
+}
+
+MAX_NEW_TOKENS = {"direct": 64, "cot": 384, "filler": 384}
+
+
+def free():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def safe_name(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", s)
+
+
+def build_prompts(tokenizer, questions: list[str], mode: str) -> list[str]:
+    sys_msg = SYSTEM_PROMPTS[mode]
+    is_gemma = "gemma" in str(getattr(tokenizer, "name_or_path", "")).lower()
+    prompts = []
+    for q in questions:
+        if is_gemma:
+            msgs = [
+                {"role": "user", "content": f"{sys_msg}\n\nQuestion: {q}\nAnswer:"}
+            ]
+        else:
+            msgs = [
+                {"role": "system", "content": sys_msg},
+                {"role": "user",   "content": f"Question: {q}\nAnswer:"},
+            ]
+        prompts.append(
+            tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+        )
+    return prompts
+
+
+@torch.no_grad()
+def compute_p_true_batch(model, tokenizer, questions: list[str], answers: list[str], device: str) -> list[float]:
+    """Batched P(True) probe."""
+    prompts = [
+        f"Question: {q}\nProposed answer: {a}\nIs the proposed answer correct?\nAnswer (True or False):"
+        for q, a in zip(questions, answers)
+    ]
+    inp = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=1024).to(device)
+    logits = model(**inp).logits[:, -1, :]  # [batch, vocab]
+
+    tid = tokenizer(" True",  add_special_tokens=False).input_ids[0]
+    fid = tokenizer(" False", add_special_tokens=False).input_ids[0]
+
+    sub_logits = logits[:, [tid, fid]]
+    probs = F.softmax(sub_logits, dim=-1)[:, 0]  # P(True)
+    return probs.cpu().tolist()
+
+
+@torch.no_grad()
+def process_batch(model, tokenizer, batch_rows, questions_by_id, mode, device):
+    """
+    Process a batch of questions in parallel on CUDA with zero intermediate memory bloat:
+    1. Generate answers + logit metrics (mean top-1 prob, mean entropy)
+    2. Single forward pass to extract hidden states (h_last and h_pre)
+    3. Batched P(True) probe
+    """
+    max_new = MAX_NEW_TOKENS[mode]
+    questions = [questions_by_id.get(r["id"], {}).get("question", "") for r in batch_rows]
+    batch_size = len(batch_rows)
+
+    prompts = build_prompts(tokenizer, questions, mode)
+    inp = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=1024).to(device)
+    padded_prompt_len = inp.input_ids.shape[1]
+
+    # Pass 1: Generate answers and token scores (lightweight, no hidden states in loop)
+    out = model.generate(
+        **inp,
+        max_new_tokens=max_new,
+        do_sample=False,
+        output_scores=True,
+        return_dict_in_generate=True,
+        pad_token_id=tokenizer.eos_token_id,
+    )
+
+    gen_sequences = out.sequences  # [batch, padded_prompt_len + gen_len]
+
+    # 1. Decode answers
+    answers = []
+    for i in range(batch_size):
+        gen_tokens = gen_sequences[i, padded_prompt_len:]
+        ans_text = tokenizer.decode(gen_tokens, skip_special_tokens=True).strip()
+        answers.append(ans_text)
+
+    # 2. Extract Logit signals
+    if out.scores:
+        scores_stacked = torch.stack(out.scores, dim=1)  # [batch, gen_len, vocab]
+        probs_all = F.softmax(scores_stacked, dim=-1)     # [batch, gen_len, vocab]
+        top1_all = probs_all.max(dim=-1).values           # [batch, gen_len]
+        ent_all = -(probs_all * torch.log(probs_all + 1e-10)).sum(dim=-1) # [batch, gen_len]
+        
+        top1_means = top1_all.mean(dim=-1).cpu().tolist()
+        ent_means = ent_all.mean(dim=-1).cpu().tolist()
+        del scores_stacked, probs_all, top1_all, ent_all
+    else:
+        top1_means = [float("nan")] * batch_size
+        ent_means = [float("nan")] * batch_size
+
+    # Pass 2: Single full forward pass for hidden states (instantaneous, freed immediately)
+    out_h = model(gen_sequences, output_hidden_states=True, use_cache=False)
+    hs = out_h.hidden_states  # tuple of (L+1) tensors: [batch, total_len, H]
+    
+    pre_idx = padded_prompt_len - 1
+    last_idx = gen_sequences.shape[1] - 1
+
+    h_pre_batch = []
+    h_last_batch = []
+    for i in range(batch_size):
+        h_pre_layers = torch.stack([layer[i, pre_idx, :].cpu() for layer in hs]).float().numpy()
+        h_last_layers = torch.stack([layer[i, last_idx, :].cpu() for layer in hs]).float().numpy()
+        h_pre_batch.append(h_pre_layers)
+        h_last_batch.append(h_last_layers)
+
+    del out, out_h, hs, gen_sequences, inp
+
+    # Pass 3: Batched P(True) probe
+    ptrue_list = compute_p_true_batch(model, tokenizer, questions, answers, device)
+
+    # Pack results
+    results = []
+    for i, row in enumerate(batch_rows):
+        results.append({
+            "h_last": h_last_batch[i],
+            "h_pre": h_pre_batch[i],
+            "y": int(bool(row["correct"])),
+            "verb": float(row["verbalized_confidence"]) if pd.notna(row["verbalized_confidence"]) else float("nan"),
+            "logit": top1_means[i],
+            "meanent": ent_means[i],
+            "ptrue": ptrue_list[i],
+        })
+
+    return results
+
+
+def run_model_pipeline(model_name: str, modes: list[str], calib_df: pd.DataFrame,
+                       questions_by_id: dict, device: str):
+    """Loads model once, processes all modes with adaptive batching, and cleanly unloads."""
+    hf_id = MODEL_REGISTRY[model_name]
+    
+    modes_to_run = []
+    for mode in modes:
+        out_path = ACTIVATIONS / f"internal_{safe_name(model_name)}_{mode}.npz"
+        alt_path = RESULTS / f"internal_{safe_name(model_name)}_{mode}.npz"
+        if not out_path.exists() and not alt_path.exists():
+            modes_to_run.append(mode)
+        else:
+            print(f"  [Skipping] {out_path.name} already exists.", flush=True)
+
+    if not modes_to_run:
+        print(f"All modes for {model_name} are already completed!", flush=True)
+        return
+
+    print(f"\n" + "=" * 75, flush=True)
+    print(f"LOADING MODEL: {model_name} ({hf_id})", flush=True)
+    print(f"Modes to extract: {modes_to_run}", flush=True)
+    print("=" * 75, flush=True)
+
+    is_large = any(x in hf_id for x in ["3B", "8B", "Phi-3", "Phi-3.5"])
+    
+    tokenizer = AutoTokenizer.from_pretrained(hf_id, trust_remote_code=False)
+    tokenizer.padding_side = "left"
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    load_kwargs = dict(
+        torch_dtype=torch.float16,
+        trust_remote_code=False,
+        attn_implementation="sdpa" if not is_large else "eager"
+    )
+
+    try:
+        if is_large:
+            from transformers import BitsAndBytesConfig
+            bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16)
+            model = AutoModelForCausalLM.from_pretrained(
+                hf_id, quantization_config=bnb, trust_remote_code=False,
+                attn_implementation="eager", low_cpu_mem_usage=True
+            )
+            print(f"  [4-bit loaded successfully]", flush=True)
+        else:
+            model = AutoModelForCausalLM.from_pretrained(hf_id, **load_kwargs).to(device)
+            print(f"  [fp16 + SDPA loaded on {device}]", flush=True)
+    except Exception as e:
+        print(f"  [Fallback fp16] Loading {model_name} with default settings due to: {e}", flush=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            hf_id, torch_dtype=torch.float16, trust_remote_code=False
+        ).to(device)
+
+    model.eval()
+
+    # Iterate through modes
+    for mode in modes_to_run:
+        out_path = ACTIVATIONS / f"internal_{safe_name(model_name)}_{mode}.npz"
+        sub = calib_df[(calib_df["model"] == model_name) &
+                       (calib_df["mode"]  == mode) &
+                       (calib_df["dataset"] == "gsm8k")].copy()
+
+        if sub.empty:
+            print(f"  No rows found for {model_name}/{mode}. Skipping.", flush=True)
+            continue
+
+        # Adaptive batch sizing: 4 for short direct mode, 2 for long CoT/Filler
+        batch_size = 4 if mode == "direct" else 2
+        if is_large and mode != "direct":
+            batch_size = 1
+
+        print(f"\n  >>> Extracting {mode.upper()} mode ({len(sub)} questions) in batches of {batch_size}...", flush=True)
+        
+        rows = sub.to_dict("records")
+        valid_rows = [r for r in rows if r["id"] in questions_by_id]
+        
+        all_extracted = []
+        for i in range(0, len(valid_rows), batch_size):
+            batch_rows = valid_rows[i:i + batch_size]
+            try:
+                extracted = process_batch(model, tokenizer, batch_rows, questions_by_id, mode, device)
+                all_extracted.extend(extracted)
+            except torch.cuda.OutOfMemoryError:
+                print(f"    [OOM warning on batch {i}] Clearing cache and falling back to single item...", flush=True)
+                free()
+                for single_row in batch_rows:
+                    try:
+                        extracted = process_batch(model, tokenizer, [single_row], questions_by_id, mode, device)
+                        all_extracted.extend(extracted)
+                    except Exception as ex:
+                        print(f"    Error on item {single_row['id']}: {ex}", flush=True)
+            except Exception as e:
+                print(f"    Error on batch {i}-{i+len(batch_rows)}: {e}", flush=True)
+                continue
+
+            # Free cache periodically
+            if i % 20 == 0:
+                free()
+
+            if (len(all_extracted)) % 40 < batch_size or len(all_extracted) >= len(valid_rows):
+                print(f"    Progress: {len(all_extracted)}/{len(valid_rows)} questions completed", flush=True)
+
+        if len(all_extracted) >= 10:
+            np.savez_compressed(
+                out_path,
+                H=np.stack([x["h_last"] for x in all_extracted]),
+                H_pre=np.stack([x["h_pre"] for x in all_extracted]),
+                y=np.array([x["y"] for x in all_extracted]),
+                verb=np.array([x["verb"] for x in all_extracted]),
+                logit=np.array([x["logit"] for x in all_extracted]),
+                meanent=np.array([x["meanent"] for x in all_extracted]),
+                ptrue=np.array([x["ptrue"] for x in all_extracted]),
+            )
+            print(f"  Saved {out_path.name} | shape: {np.stack([x['h_last'] for x in all_extracted]).shape}", flush=True)
+
+    del model, tokenizer
+    free()
+    print(f"Finished and freed {model_name} from VRAM.", flush=True)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", default=None, help="Model name to run (default: all)")
+    parser.add_argument("--mode",  default=None, help="Mode: direct/cot/filler (default: all)")
+    args = parser.parse_args()
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Running ultra-stable extraction on: {device}", flush=True)
+
+    print("Loading GSM8K questions bank...", flush=True)
+    questions = load_gsm8k(n=200, seed=42)
+    questions_by_id = {q["id"]: q for q in questions}
+    print(f"  {len(questions_by_id)} questions loaded.", flush=True)
+
+    print("Loading calibration records...", flush=True)
+    base_df   = pd.read_csv(RESULTS / "master_e1_e3_logit_calibration.csv")
+    filler_df = pd.read_csv(RESULTS / "master_e4_filler_cot.csv")
+    filler_df["mode"] = "filler"
+    calib_df  = pd.concat([base_df, filler_df], ignore_index=True)
+
+    models = [args.model] if args.model else list(MODEL_REGISTRY.keys())
+    modes  = [args.mode]  if args.mode  else ["direct", "cot", "filler"]
+
+    for m_name in models:
+        if m_name not in MODEL_REGISTRY:
+            print(f"Unknown model: {m_name}. Skipping.", flush=True)
+            continue
+        run_model_pipeline(m_name, modes, calib_df, questions_by_id, device)
+
+    print("\n" + "=" * 75, flush=True)
+    print("ALL EXTRACTIONS COMPLETED SUCCESSFULLY!", flush=True)
+    print("=" * 75, flush=True)
+
+
+if __name__ == "__main__":
+    main()

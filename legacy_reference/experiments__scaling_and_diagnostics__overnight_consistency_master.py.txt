@@ -1,0 +1,336 @@
+"""
+overnight_consistency_master.py — Cross-Scale Consistency Runner
+================================================================
+Evaluates Direct, CoT, and Filler-CoT paraphrase consistency across all models.
+Designed for an overnight local run on an 8GB VRAM GPU.
+
+Models:
+  - Qwen2.5-0.5B, Qwen2.5-1.5B (Non-gated)
+  - SmolLM2-360M, SmolLM2-1.7B (Non-gated)
+  - Phi-3-mini, Phi-3.5-mini (Non-gated, 3.8B)
+  - Llama-3.2-1B, Llama-3.2-3B (Gated — needs HF_TOKEN)
+
+Features:
+  - Correct per-sequence decode using attention mask
+  - Batched GPU inference for maximum throughput
+  - Incremental saving: safe to restart after crash
+  - Empty parse failures counted as mismatches (not silently dropped)
+"""
+
+import gc
+import json
+import re
+import numpy as np
+import pandas as pd
+import torch
+from pathlib import Path
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+RESULTS = Path("results")
+DATA = Path("data")
+RESULTS.mkdir(exist_ok=True)
+
+MODELS = [
+    # Non-gated — runs without HF_TOKEN
+    ("Qwen2.5-0.5B",  "Qwen/Qwen2.5-0.5B-Instruct"),
+    ("SmolLM2-360M",  "HuggingFaceTB/SmolLM2-360M-Instruct"),
+    ("Qwen2.5-1.5B",  "Qwen/Qwen2.5-1.5B-Instruct"),
+    ("SmolLM2-1.7B",  "HuggingFaceTB/SmolLM2-1.7B-Instruct"),
+    ("Phi-3-mini",    "microsoft/Phi-3-mini-4k-instruct"),
+    ("Phi-3.5-mini",  "microsoft/Phi-3.5-mini-instruct"),
+    # Gated — auto-skipped if HF_TOKEN not set
+    ("Llama-3.2-1B",  "meta-llama/Llama-3.2-1B-Instruct"),
+    ("Llama-3.2-3B",  "meta-llama/Llama-3.2-3B-Instruct"),
+]
+
+SYSTEM_PROMPTS = {
+    "direct": (
+        "You are a helpful math assistant. Provide the final answer directly "
+        "with no explanation. End with 'Answer: <your answer>'."
+    ),
+    "cot": (
+        "You are a helpful math assistant. Think step-by-step to solve the problem. "
+        "End with 'Answer: <your answer>'."
+    ),
+    "filler": (
+        "You are a helpful assistant. Before answering, share your general thoughts "
+        "and associations about the topic. Reflect broadly on what comes to mind, "
+        "then give your final answer. End your response with 'Answer: <your answer>'."
+    ),
+}
+
+MAX_NEW_TOKENS = {
+    "direct": 64,
+    "cot":    384,
+    "filler": 384,
+}
+
+LIMIT_QUESTIONS = 30    # Questions per model (×5 paraphrase variants = 150 inferences)
+BATCH_SIZE      = 5     # All 5 paraphrase variants of one question in one forward pass
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def parse_answer(text: str) -> str:
+    """
+    Parse final answer from model response.
+    Returns "" (empty string) on failure — callers must treat "" as a mismatch.
+    """
+    # Match "Answer: 42" or "Answer: B" etc.
+    m = re.findall(r'Answer:\s*([+-]?\d[\d,\.]*|[A-Z])', text, re.IGNORECASE)
+    if m:
+        return m[-1].replace(',', '').strip().lower()
+    return ""
+
+
+def compute_consistency(predictions: list[str]) -> float:
+    """
+    Compute pair-wise agreement rate over a list of predictions.
+    Empty strings are treated as MISMATCHES (not silently skipped).
+    Returns a float in [0, 1].
+    """
+    n = len(predictions)
+    if n < 2:
+        return 0.0
+    total_pairs = n * (n - 1) / 2
+    agree_count = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            pi, pj = predictions[i], predictions[j]
+            # Both must be non-empty AND equal to count as agreement
+            if pi and pj and pi == pj:
+                agree_count += 1
+    return agree_count / total_pairs
+
+
+def free_memory():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+# ---------------------------------------------------------------------------
+# Per-model evaluation
+# ---------------------------------------------------------------------------
+
+def evaluate_model(
+    model_name: str,
+    hf_id: str,
+    para_dict: dict,
+    limit_questions: int = LIMIT_QUESTIONS,
+) -> list[dict]:
+    """
+    Load one model, run all 3 modes (direct / cot / filler),
+    return a list of {model, mode, consistency} dicts.
+    """
+    print(f"\n{'='*60}")
+    print(f"MODEL: {model_name}")
+    print(f"{'='*60}")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    is_phi = "Phi" in hf_id
+    # Models >3B may OOM on 8GB VRAM at fp16 — use 4-bit as fallback
+    is_large = any(x in hf_id for x in ["Phi-3", "Phi-3.5", "Llama-3.2-3B", "Llama-3.1-8B"])
+
+    # ---------- Load model ------------------------------------------------
+    try:
+        # trust_remote_code=False: rely on native transformers for all models.
+        # Phi remote modeling_phi3.py causes DynamicCache 'type' KeyError.
+        tokenizer = AutoTokenizer.from_pretrained(
+            hf_id, trust_remote_code=False
+        )
+        # Left-padding is REQUIRED for correct batched generation
+        tokenizer.padding_side = "left"
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+        # Try fp16 first; fall back to 4-bit if VRAM is insufficient
+        load_kwargs = dict(
+            torch_dtype=torch.float16,
+            trust_remote_code=False,
+            attn_implementation="eager" if is_phi else None,
+        )
+        if is_large:
+            try:
+                from transformers import BitsAndBytesConfig
+                bnb_cfg = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16)
+                model = AutoModelForCausalLM.from_pretrained(
+                    hf_id, quantization_config=bnb_cfg, trust_remote_code=False,
+                    attn_implementation="eager" if is_phi else None,
+                    low_cpu_mem_usage=True,
+                )
+                print(f"[4-bit] Loaded {model_name} in 4-bit quantization.")
+            except Exception:
+                model = AutoModelForCausalLM.from_pretrained(hf_id, **load_kwargs).to(device)
+        else:
+            model = AutoModelForCausalLM.from_pretrained(hf_id, **load_kwargs).to(device)
+
+        model.eval()
+        vram = round(torch.cuda.memory_allocated() / 1e9, 1) if torch.cuda.is_available() else 0
+        print(f"Loaded on {device}. VRAM: {vram} GB")
+    except Exception as e:
+        print(f"FAILED to load {model_name}: {e}")
+        return []
+
+    # ---------- Filter paraphrase questions --------------------------------
+    # Keep only gsm8k entries that have ≥3 variants (we use up to 5)
+    valid_items = {
+        k: v
+        for k, v in para_dict.items()
+        if "gsm8k" in k and len(v) >= 3
+    }
+    selected_keys = list(valid_items.keys())[:limit_questions]
+    print(f"Questions: {len(selected_keys)} × up to 5 paraphrase variants")
+
+    model_results = []
+
+    # ---------- Iterate modes ----------------------------------------------
+    for mode in ["direct", "cot", "filler"]:
+        print(f"  -> {mode.upper()} mode ...", end="", flush=True)
+        sys_prompt = SYSTEM_PROMPTS[mode]
+        max_new = MAX_NEW_TOKENS[mode]
+
+        all_predictions = {}  # q_key -> list[str]
+
+        for q_key in selected_keys:
+            variants = valid_items[q_key][:BATCH_SIZE]  # up to 5 variants
+
+            # Build chat-formatted prompts
+            prompts = []
+            for text in variants:
+                messages = [
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user",   "content": f"Question: {text}\nAnswer:"},
+                ]
+                prompts.append(
+                    tokenizer.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True
+                    )
+                )
+
+            # Tokenize the whole batch
+            batch_enc = tokenizer(
+                prompts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=1024,
+            ).to(device)
+
+            with torch.no_grad():
+                output_ids = model.generate(
+                    **batch_enc,
+                    max_new_tokens=max_new,
+                    do_sample=False,
+                    pad_token_id=tokenizer.eos_token_id,
+                )
+
+            # --- BUG FIX: per-sequence decode using attention mask --------
+            # Each sequence has a different number of real prompt tokens
+            # (because of left-padding). We must slice off only the newly
+            # generated tokens for each sequence individually.
+            attention_mask = batch_enc["attention_mask"]  # (batch, seq_len)
+            preds = []
+            for seq_idx in range(len(variants)):
+                # Number of real (non-pad) prompt tokens for this sequence
+                prompt_len = int(attention_mask[seq_idx].sum().item())
+                generated = output_ids[seq_idx][prompt_len:]
+                resp = tokenizer.decode(generated, skip_special_tokens=True).strip()
+                preds.append(parse_answer(resp))
+
+            all_predictions[q_key] = preds
+
+        # Compute per-question consistency, then average
+        question_consistencies = [
+            compute_consistency(preds)
+            for preds in all_predictions.values()
+        ]
+        c_val = float(np.mean(question_consistencies))
+        print(f" {c_val*100:.1f}%")
+
+        model_results.append({"model": model_name, "mode": mode, "consistency": c_val})
+
+    # ---------- Teardown ---------------------------------------------------
+    del model
+    del tokenizer
+    free_memory()
+
+    return model_results
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    print("=" * 70)
+    print("OVERNIGHT CONSISTENCY BENCHMARK")
+    print("=" * 70)
+
+    para_path = DATA / "paraphrases.json"
+    if not para_path.exists():
+        print(f"ERROR: {para_path} not found!")
+        return
+
+    with open(para_path, "r") as f:
+        para_dict = json.load(f)
+
+    out_csv = RESULTS / "overnight_consistency_summary.csv"
+    all_summary: list[dict] = []
+    completed_models: set[str] = set()
+
+    # Resume from previous run if partial results exist
+    if out_csv.exists():
+        existing = pd.read_csv(out_csv)
+        all_summary = existing.to_dict("records")
+        # A model is complete only if all 3 modes were saved for it
+        counts = existing.groupby("model")["mode"].count()
+        completed_models = set(counts[counts >= 3].index.tolist())
+        print(f"Resuming: already completed {sorted(completed_models)}")
+
+    for model_name, hf_id in MODELS:
+        if model_name in completed_models:
+            print(f"Skipping {model_name} (already done).")
+            continue
+
+        results = evaluate_model(model_name, hf_id, para_dict)
+        if results:
+            all_summary.extend(results)
+            pd.DataFrame(all_summary).to_csv(out_csv, index=False)
+            print(f"  Saved progress -> {out_csv}")
+
+    # ---------- Final summary ----------------------------------------------
+    print("\n" + "=" * 70)
+    print("BENCHMARK COMPLETE — FINAL RESULTS")
+    print("=" * 70)
+
+    final_df = pd.DataFrame(all_summary)
+    if final_df.empty:
+        print("No results generated.")
+        return
+
+    pivot = (
+        final_df
+        .pivot(index="model", columns="mode", values="consistency")
+        .reset_index()
+    )
+    # Ensure column order
+    for col in ["direct", "cot", "filler"]:
+        if col not in pivot.columns:
+            pivot[col] = float("nan")
+    pivot = pivot[["model", "direct", "cot", "filler"]]
+    pivot.columns = ["Model", "Direct Consistency", "CoT Consistency", "Filler Consistency"]
+
+    # Add delta columns for the paper
+    pivot["CoT - Direct"] = pivot["CoT Consistency"] - pivot["Direct Consistency"]
+    pivot["Filler - Direct"] = pivot["Filler Consistency"] - pivot["Direct Consistency"]
+
+    print(pivot.to_string(index=False))
+    pivot.to_csv(RESULTS / "overnight_consistency_final.csv", index=False)
+    print(f"\nFull table saved to results/overnight_consistency_final.csv")
+
+
+if __name__ == "__main__":
+    main()

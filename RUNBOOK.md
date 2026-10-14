@@ -1,4 +1,6 @@
-# LIGHT Paper — Complete Runbook
+# Historical LIGHT runbook
+
+> Superseded: use [SERVER_COMMANDS.md](SERVER_COMMANDS.md) and `bash run_everything.sh` for all new experiments. The material below documents the historical workflow and must not be used to produce the revised paper's results.
 
 ## Paper Title
 "Beyond Accuracy: Calibration, Confidence, and Paraphrase Robustness of CoT Reasoning in Sub-3B Language Models"

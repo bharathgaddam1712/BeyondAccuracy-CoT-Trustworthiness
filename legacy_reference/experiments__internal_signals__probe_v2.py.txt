@@ -1,0 +1,587 @@
+"""
+probe_v2.py — RIGOROUS LINEAR PROBING, CROSS-DATASET TRANSFER & GAP TESTING
+===========================================================================
+Implements the bulletproof 6-step probing analysis:
+  1. Logit anomaly diagnosis (checks mean logit on correct vs. wrong).
+  2. 5-Fold Stratified CV linear probe with balanced weights, 2,000 bootstrap CIs,
+     pre-registered 70%-depth layer (primary), last layer, best layer (upper bound),
+     and shuffled-label null baseline (~0.5). Evaluates both H and H_pre.
+  3. Cross-dataset transfer test (train on Dataset A, evaluate on Dataset B).
+  4. Paired probe-vs-verbalized difference test (Gap test with 5,000 bootstrap iterations & p-value).
+  5. Full layer trajectory tracking without cherry-picking.
+  6. Consolidated verdict table applying the explicit decision rule.
+"""
+
+import argparse
+import sys
+import warnings
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import StratifiedKFold, cross_val_predict
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+
+warnings.filterwarnings("ignore")
+
+ROOT = Path(__file__).resolve().parents[2]
+RESULTS = ROOT / "results"
+ACTIVATIONS = RESULTS / "activations"
+SUMMARY = RESULTS / "summary"
+FIGURES = ROOT / "figures"
+
+ACTIVATIONS.mkdir(parents=True, exist_ok=True)
+SUMMARY.mkdir(parents=True, exist_ok=True)
+FIGURES.mkdir(parents=True, exist_ok=True)
+
+MODEL_SIZES = {
+    "Qwen2.5-0.5B":  0.5,
+    "Llama-3.2-1B":  1.0,
+    "Qwen2.5-1.5B":  1.5,
+    "Gemma-2-2B":    2.0,
+    "Llama-3.2-3B":  3.0,
+}
+
+MIN_POS = 15  # Minimum positive & negative samples required for stable probing
+
+
+# ---------------------------------------------------------------------------
+# Core Probing & Fast Vectorized Bootstrap Utilities
+# ---------------------------------------------------------------------------
+
+def oof_predictions(X: np.ndarray, y: np.ndarray, seed: int = 0) -> np.ndarray:
+    """Returns out-of-fold probability predictions via 5-fold Stratified CV."""
+    if len(np.unique(y)) < 2:
+        return np.full(len(y), np.nan)
+    clf = make_pipeline(
+        StandardScaler(),
+        LogisticRegression(max_iter=1000, C=0.5, class_weight="balanced", random_state=seed)
+    )
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=seed)
+    return cross_val_predict(clf, X, y, cv=cv, method="predict_proba")[:, 1]
+
+
+def fast_bootstrap_auroc(y: np.ndarray, scores: np.ndarray, n_boot: int = 2000, seed: int = 0) -> tuple[float, float]:
+    """Ultra-fast rank-based bootstrap confidence interval for AUROC."""
+    mask = ~np.isnan(scores) & ~np.isnan(y)
+    y_clean = y[mask].astype(int)
+    s_clean = scores[mask]
+    n = len(y_clean)
+    if len(np.unique(y_clean)) < 2:
+        return float("nan"), float("nan")
+
+    rng = np.random.default_rng(seed)
+    boot_indices = rng.integers(0, n, size=(n_boot, n))
+
+    aucs = []
+    for idx in boot_indices:
+        yb = y_clean[idx]
+        n1 = np.sum(yb)
+        n0 = len(yb) - n1
+        if n1 == 0 or n0 == 0:
+            continue
+        sb = s_clean[idx]
+        rank = np.argsort(np.argsort(sb)) + 1
+        u = np.sum(rank[yb == 1]) - n1 * (n1 + 1) / 2.0
+        aucs.append(u / (n1 * n0))
+
+    if not aucs:
+        return float("nan"), float("nan")
+    ci_low, ci_high = np.percentile(aucs, [2.5, 97.5])
+    return float(ci_low), float(ci_high)
+
+
+def fast_auc_point_estimate(X: np.ndarray, y: np.ndarray, seed: int = 0) -> float:
+    """Fast out-of-fold point estimate AUROC without bootstrap overhead."""
+    n_pos = int(y.sum())
+    n_neg = len(y) - n_pos
+    if n_pos < MIN_POS or n_neg < MIN_POS:
+        return float("nan")
+    try:
+        scores = oof_predictions(X, y, seed=seed)
+        return roc_auc_score(y, scores)
+    except Exception:
+        return float("nan")
+
+
+def probe_single_layer_with_ci(X: np.ndarray, y: np.ndarray, seed: int = 0):
+    """Trains 5-fold CV probe and calculates point estimate + 95% bootstrap CI."""
+    n_pos = int(y.sum())
+    n_neg = len(y) - n_pos
+    if n_pos < MIN_POS or n_neg < MIN_POS:
+        return None
+    try:
+        scores = oof_predictions(X, y, seed=seed)
+        auc = roc_auc_score(y, scores)
+        ci_low, ci_high = fast_bootstrap_auroc(y, scores, n_boot=2000, seed=seed)
+        return auc, (ci_low, ci_high), scores
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Step 3: Cross-Dataset Transfer Test
+# ---------------------------------------------------------------------------
+
+def evaluate_transfer(npz_path: Path, layer: int, train_ds: str, test_ds: str, seed: int = 0):
+    """
+    Trains linear probe on train_ds, evaluates on held-out test_ds.
+    Returns: transfer_auc, (ci_low, ci_high), n_train, n_test
+    """
+    d = np.load(npz_path, allow_pickle=True)
+    if "dataset" not in d:
+        return None
+
+    H = d["H"][:, layer, :]
+    y = d["y"].astype(int)
+    datasets = d["dataset"].astype(str)
+
+    tr_mask = (datasets == train_ds)
+    te_mask = (datasets == test_ds)
+
+    y_tr, y_te = y[tr_mask], y[te_mask]
+    if len(y_tr) == 0 or len(y_te) == 0:
+        return None
+    if y_tr.sum() < 8 or (len(y_tr) - y_tr.sum()) < 8:
+        return None
+    if y_te.sum() < 5 or (len(y_te) - y_te.sum()) < 5:
+        return None
+
+    clf = make_pipeline(
+        StandardScaler(),
+        LogisticRegression(max_iter=1000, C=0.5, class_weight="balanced", random_state=seed)
+    )
+    clf.fit(H[tr_mask], y_tr)
+    scores_te = clf.predict_proba(H[te_mask])[:, 1]
+
+    auc_te = roc_auc_score(y_te, scores_te)
+    ci_low, ci_high = fast_bootstrap_auroc(y_te, scores_te, n_boot=2000, seed=seed)
+    return auc_te, (ci_low, ci_high), len(y_tr), len(y_te)
+
+
+# ---------------------------------------------------------------------------
+# Step 4: Paired Probe-vs-Verbalized Gap Test
+# ---------------------------------------------------------------------------
+
+def evaluate_gap(npz_path: Path, layer: int, n_boot: int = 5000, seed: int = 0):
+    """
+    Direct bootstrap difference test: Delta = AUROC(probe) - AUROC(verbalized).
+    Evaluated on the matched subset of items with valid verbalized confidence.
+    """
+    d = np.load(npz_path, allow_pickle=True)
+    H = d["H"][:, layer, :]
+    y = d["y"].astype(int)
+    verb = d["verb"].astype(float) if "verb" in d else np.full(len(y), np.nan)
+
+    if len(np.unique(y)) < 2:
+        return None
+
+    mask = ~np.isnan(verb)
+    y_sub = y[mask]
+    n_pos = int(y_sub.sum())
+    if n_pos < MIN_POS or (len(y_sub) - n_pos) < MIN_POS or len(np.unique(y_sub)) < 2:
+        return None
+
+    probe_scores = oof_predictions(H, y, seed=seed)
+    if np.any(np.isnan(probe_scores)):
+        return None
+
+    p_sub = probe_scores[mask]
+    v_sub = verb[mask]
+
+    actual_gap = roc_auc_score(y_sub, p_sub) - roc_auc_score(y_sub, v_sub)
+
+    rng = np.random.default_rng(seed)
+    n_items = len(y_sub)
+    boot_indices = rng.integers(0, n_items, size=(n_boot, n_items))
+
+    diffs = []
+    for idx in boot_indices:
+        yb = y_sub[idx]
+        n1 = np.sum(yb)
+        n0 = len(yb) - n1
+        if n1 == 0 or n0 == 0:
+            continue
+        # Fast rank for probe
+        sp = p_sub[idx]
+        rp = np.argsort(np.argsort(sp)) + 1
+        auc_p = (np.sum(rp[yb == 1]) - n1 * (n1 + 1) / 2.0) / (n1 * n0)
+        # Fast rank for verbalized
+        sv = v_sub[idx]
+        rv = np.argsort(np.argsort(sv)) + 1
+        auc_v = (np.sum(rv[yb == 1]) - n1 * (n1 + 1) / 2.0) / (n1 * n0)
+
+        diffs.append(auc_p - auc_v)
+
+    diffs = np.array(diffs)
+    ci_low, ci_high = np.percentile(diffs, [2.5, 97.5])
+    p_val = 2.0 * min((diffs <= 0).mean(), (diffs >= 0).mean())
+    p_val = min(1.0, max(0.0, p_val))
+
+    return actual_gap, (float(ci_low), float(ci_high)), float(p_val), len(y_sub)
+
+
+# ---------------------------------------------------------------------------
+# Complete File Analyzer (Steps 1, 2, 3, 4, 5, 6)
+# ---------------------------------------------------------------------------
+
+def analyze_npz(npz_path: Path):
+    stem = npz_path.stem.replace("internal_", "")
+    parts = stem.split("_")
+    mode = parts[-1]
+    model = "_".join(parts[:-1])
+
+    d = np.load(npz_path, allow_pickle=True)
+    H = d["H"]                                              # [N, L+1, Hdim]
+    H_pre = d["H_pre"] if "H_pre" in d else None            # [N, L+1, Hdim]
+    y = d["y"].astype(int)
+    verb = d["verb"].astype(float) if "verb" in d else np.full(len(y), np.nan)
+    logit = d["logit"].astype(float) if "logit" in d else np.full(len(y), np.nan)
+    ptrue = d["ptrue"].astype(float) if "ptrue" in d else np.full(len(y), np.nan)
+    datasets = d["dataset"].astype(str) if "dataset" in d else np.array(["gsm8k"] * len(y))
+
+    n_samples = len(y)
+    n_pos = int(y.sum())
+    n_layers = H.shape[1]
+    fixed_layer = int(0.7 * (n_layers - 1))
+
+    print(f"\n{'='*75}", flush=True)
+    print(f"ANALYZING: {model} | Mode: {mode.upper()} | N={n_samples} | Pos={n_pos} ({n_pos/n_samples*100:.1f}%) | Layers={n_layers}", flush=True)
+    print(f"{'='*75}", flush=True)
+
+    # 1. Step 1: Logit Anomaly Diagnosis
+    logit_mask = ~np.isnan(logit)
+    if logit_mask.sum() > 0 and len(np.unique(y[logit_mask])) > 1:
+        auc_logit = roc_auc_score(y[logit_mask], logit[logit_mask])
+        mean_cor = logit[logit_mask & (y == 1)].mean()
+        mean_wrg = logit[logit_mask & (y == 0)].mean()
+        print(f"  [Logit Diagnosis] AUROC: {auc_logit:.4f} | mean(correct)={mean_cor:.4f} | mean(wrong)={mean_wrg:.4f}", flush=True)
+    else:
+        auc_logit = float("nan")
+
+    # Verbalized AUROC
+    verb_mask = ~np.isnan(verb)
+    if verb_mask.sum() >= MIN_POS and len(np.unique(y[verb_mask])) > 1:
+        auc_verb = roc_auc_score(y[verb_mask], verb[verb_mask])
+        ci_verb = fast_bootstrap_auroc(y[verb_mask], verb[verb_mask])
+    else:
+        auc_verb = float("nan")
+        ci_verb = (float("nan"), float("nan"))
+    print(f"  [Verbalized Conf] AUROC: {auc_verb:.4f}  95%CI [{ci_verb[0]:.4f}, {ci_verb[1]:.4f}] (N={verb_mask.sum()})", flush=True)
+
+    # 2. Step 2: Layer Sweep (Fast Point Estimates)
+    curve_h = []
+    curve_h_pre = []
+    for l in range(n_layers):
+        auc_h_l = fast_auc_point_estimate(H[:, l, :], y)
+        auc_pre_l = fast_auc_point_estimate(H_pre[:, l, :], y) if H_pre is not None else np.nan
+        curve_h.append(auc_h_l)
+        curve_h_pre.append(auc_pre_l)
+
+    # Pre-registered 70%-depth layer (Primary Honest Number with Full CI)
+    res_fixed = probe_single_layer_with_ci(H[:, fixed_layer, :], y)
+    auc_fixed = res_fixed[0] if res_fixed else float("nan")
+    ci_fixed = res_fixed[1] if res_fixed else (float("nan"), float("nan"))
+
+    # Pre-registered 70%-depth layer on H_pre
+    if H_pre is not None:
+        res_fixed_pre = probe_single_layer_with_ci(H_pre[:, fixed_layer, :], y)
+        auc_fixed_pre = res_fixed_pre[0] if res_fixed_pre else float("nan")
+        ci_fixed_pre = res_fixed_pre[1] if res_fixed_pre else (float("nan"), float("nan"))
+    else:
+        auc_fixed_pre = float("nan")
+        ci_fixed_pre = (float("nan"), float("nan"))
+
+    # Last layer
+    res_last = probe_single_layer_with_ci(H[:, -1, :], y)
+    auc_last = res_last[0] if res_last else float("nan")
+    ci_last = res_last[1] if res_last else (float("nan"), float("nan"))
+
+    # Best layer (Upper Bound)
+    if not np.all(np.isnan(curve_h)):
+        best_layer = int(np.nanargmax(curve_h))
+        res_best = probe_single_layer_with_ci(H[:, best_layer, :], y)
+        auc_best = res_best[0] if res_best else float("nan")
+        ci_best = res_best[1] if res_best else (float("nan"), float("nan"))
+    else:
+        best_layer = 0
+        auc_best = float("nan")
+        ci_best = (float("nan"), float("nan"))
+
+    # Shuffled Null Baseline at 70% depth
+    rng = np.random.default_rng(42)
+    y_shuffled = rng.permutation(y)
+    res_null = probe_single_layer_with_ci(H[:, fixed_layer, :], y_shuffled)
+    auc_null = res_null[0] if res_null else float("nan")
+
+    print(f"  [Probe @ 70% (L{fixed_layer})] AUROC: {auc_fixed:.4f}  95%CI [{ci_fixed[0]:.4f}, {ci_fixed[1]:.4f}] (PRIMARY HONEST NUMBER)", flush=True)
+    print(f"  [Probe Pre-ans (L{fixed_layer})] AUROC: {auc_fixed_pre:.4f}  95%CI [{ci_fixed_pre[0]:.4f}, {ci_fixed_pre[1]:.4f}]", flush=True)
+    print(f"  [Probe Last  (L{n_layers-1})] AUROC: {auc_last:.4f}  95%CI [{ci_last[0]:.4f}, {ci_last[1]:.4f}]", flush=True)
+    print(f"  [Probe Best  (L{best_layer})] AUROC: {auc_best:.4f}  95%CI [{ci_best[0]:.4f}, {ci_best[1]:.4f}] (Upper Bound)", flush=True)
+    print(f"  [Shuffled Null Baseline] AUROC: {auc_null:.4f} (Must be ~0.50)", flush=True)
+
+    # 3. Step 3: Cross-Dataset Transfer Test
+    unique_ds = sorted(list(set(datasets)))
+    transfer_results = []
+    if len(unique_ds) >= 2:
+        pairs = []
+        if "gsm8k" in unique_ds and "arc" in unique_ds:
+            pairs.append(("gsm8k", "arc"))
+            pairs.append(("arc", "gsm8k"))
+        if "gsm8k" in unique_ds and "bbh" in unique_ds:
+            pairs.append(("gsm8k", "bbh"))
+        if "bbh" in unique_ds and "truthfulqa" in unique_ds:
+            pairs.append(("bbh", "truthfulqa"))
+
+        for tr_ds, te_ds in pairs:
+            t_res = evaluate_transfer(npz_path, fixed_layer, tr_ds, te_ds)
+            if t_res:
+                t_auc, (t_low, t_high), n_tr, n_te = t_res
+                transfer_results.append({
+                    "model": model, "mode": mode, "train_ds": tr_ds, "test_ds": te_ds,
+                    "transfer_auroc": t_auc, "ci_low": t_low, "ci_high": t_high,
+                    "n_train": n_tr, "n_test": n_te,
+                })
+                print(f"  [Transfer {tr_ds}->{te_ds}] AUROC: {t_auc:.4f}  95%CI [{t_low:.4f}, {t_high:.4f}]", flush=True)
+
+    mean_transfer_auc = np.nanmean([r["transfer_auroc"] for r in transfer_results]) if transfer_results else float("nan")
+
+    # 4. Step 4: Paired Gap Test (Probe vs. Verbalized)
+    gap_res = evaluate_gap(npz_path, fixed_layer)
+    if gap_res:
+        gap_mean, (gap_low, gap_high), p_val, n_gap = gap_res
+        print(f"  [Gap Test (Probe - Verb)] Delta: {gap_mean:+.4f}  95%CI [{gap_low:+.4f}, {gap_high:+.4f}] | p={p_val:.4f} (N={n_gap})", flush=True)
+    else:
+        gap_mean, gap_low, gap_high, p_val = float("nan"), float("nan"), float("nan"), float("nan")
+
+    # 5. Step 6: Explicit Decision Rule Verdict
+    ci_clears_chance = ci_fixed[0] > 0.50 if not np.isnan(ci_fixed[0]) else False
+    transfer_holds = (mean_transfer_auc > 0.50) if not np.isnan(mean_transfer_auc) else ci_clears_chance
+
+    if ci_clears_chance and transfer_holds:
+        verdict = "DECODABLE (Present at scale)"
+    elif auc_fixed > 0.55:
+        verdict = "EMERGING (Moderate decodability)"
+    else:
+        verdict = "CHANCE / INSUFFICIENT"
+
+    print(f"  >>> VERDICT: {verdict}", flush=True)
+
+    row = {
+        "model":             model,
+        "model_size":        MODEL_SIZES.get(model, 1.0),
+        "mode":              mode,
+        "n_samples":         n_samples,
+        "n_correct":         n_pos,
+        "accuracy":          n_pos / n_samples if n_samples > 0 else 0.0,
+        "auc_verbalized":    auc_verb,
+        "ci_verb_low":       ci_verb[0],
+        "ci_verb_high":      ci_verb[1],
+        "auc_logit":         auc_logit,
+        "auc_probe_70":      auc_fixed,
+        "ci_probe_70_low":   ci_fixed[0],
+        "ci_probe_70_high":  ci_fixed[1],
+        "auc_probe_pre_70":  auc_fixed_pre,
+        "ci_probe_pre_low":  ci_fixed_pre[0],
+        "ci_probe_pre_high": ci_fixed_pre[1],
+        "auc_probe_last":    auc_last,
+        "auc_probe_best":    auc_best,
+        "best_layer":        best_layer,
+        "fixed_layer":       fixed_layer,
+        "auc_null":          auc_null,
+        "mean_transfer_auc": mean_transfer_auc,
+        "gap_delta":         gap_mean,
+        "gap_ci_low":        gap_low,
+        "gap_ci_high":       gap_high,
+        "gap_p_value":       p_val,
+        "verdict":           verdict,
+        "curve_h":           curve_h,
+        "curve_h_pre":       curve_h_pre,
+    }
+
+    return row, transfer_results
+
+
+# ---------------------------------------------------------------------------
+# Plotting & Reporting
+# ---------------------------------------------------------------------------
+
+def generate_plots(summary_df: pd.DataFrame, transfer_df: pd.DataFrame):
+    plt.style.use("seaborn-v0_8-whitegrid" if "seaborn-v0_8-whitegrid" in plt.style.available else "default")
+
+    # Plot 1: Verbalized vs. Probe AUROC across Model Scale
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    direct_df = summary_df[summary_df["mode"] == "direct"].sort_values("model_size")
+
+    if not direct_df.empty:
+        x = direct_df["model_size"].values
+        y_verb = direct_df["auc_verbalized"].values
+        y_probe = direct_df["auc_probe_70"].values
+        y_pre = direct_df["auc_probe_pre_70"].values
+        y_err_low = y_probe - direct_df["ci_probe_70_low"].values
+        y_err_high = direct_df["ci_probe_70_high"].values - y_probe
+
+        ax.errorbar(x, y_probe, yerr=[y_err_low, y_err_high], fmt="o-", color="#1f77b4",
+                    linewidth=2.5, capsize=4, label="Internal Linear Probe @ 70% Depth (Primary)")
+        if not np.all(np.isnan(y_pre)):
+            ax.plot(x, y_pre, "s--", color="#2ca02c", linewidth=2.0, label="Internal Probe (Pre-Answer Token)")
+        ax.plot(x, y_verb, "^:", color="#d62728", linewidth=2.0, label="Verbalized Confidence")
+
+        ax.axhline(0.5, color="black", linestyle="--", alpha=0.6, label="Random Chance (0.5)")
+        ax.set_xlabel("Model Parameters (Billions)", fontsize=12)
+        ax.set_ylabel("Correctness AUROC", fontsize=12)
+        ax.set_title("Verbalized vs. Internal Representation Decodability Across Scale (Direct Mode)", fontsize=13, fontweight="bold")
+        ax.set_ylim(0.35, 0.90)
+        ax.set_xticks(x)
+        ax.set_xticklabels([f"{m}\n({s}B)" for m, s in zip(direct_df["model"], direct_df["model_size"])], fontsize=10)
+        ax.legend(loc="upper left", fontsize=10, framealpha=0.9)
+        plt.tight_layout()
+        plt.savefig(FIGURES / "fig_probe_v2_summary.png", dpi=300)
+        plt.close()
+
+    # Plot 2: The Decodability Gap (Probe - Verbalized)
+    fig, ax = plt.subplots(figsize=(8, 5))
+    if not direct_df.empty and "gap_delta" in direct_df:
+        valid_gaps = direct_df.dropna(subset=["gap_delta"])
+        if not valid_gaps.empty:
+            x_pos = np.arange(len(valid_gaps))
+            bars = ax.bar(x_pos, valid_gaps["gap_delta"], color="#2b5c8f", alpha=0.85, width=0.5)
+            y_err = [
+                valid_gaps["gap_delta"] - valid_gaps["gap_ci_low"],
+                valid_gaps["gap_ci_high"] - valid_gaps["gap_delta"]
+            ]
+            ax.errorbar(x_pos, valid_gaps["gap_delta"], yerr=y_err, fmt="none", color="black", capsize=5)
+
+            ax.axhline(0, color="gray", linestyle="-", linewidth=1.0)
+            ax.set_xticks(x_pos)
+            ax.set_xticklabels(valid_gaps["model"], fontsize=10)
+            ax.set_ylabel(r"Decodability Gap $\Delta$ (Probe AUROC $-$ Verbalized AUROC)", fontsize=11)
+            ax.set_title("The 'Knows But Can't Say' Gap Across Sub-3B Models", fontsize=13, fontweight="bold")
+            plt.tight_layout()
+            plt.savefig(FIGURES / "fig_probe_v2_gap.png", dpi=300)
+            plt.close()
+
+    # Plot 3: Cross-Dataset Transfer Results
+    if not transfer_df.empty:
+        fig, ax = plt.subplots(figsize=(9, 5))
+        direct_transfer = transfer_df[transfer_df["mode"] == "direct"].copy()
+        if not direct_transfer.empty:
+            direct_transfer["pair"] = direct_transfer["train_ds"] + " -> " + direct_transfer["test_ds"]
+            pivot = direct_transfer.pivot(index="model", columns="pair", values="transfer_auroc")
+            pivot.plot(kind="bar", ax=ax, colormap="tab10", width=0.7)
+        ax.axhline(0.5, color="red", linestyle="--", label="Chance (0.5)")
+        ax.set_ylabel("Out-of-Distribution Transfer AUROC", fontsize=11)
+        ax.set_title("Cross-Dataset Generalization of Internal Correctness Probes", fontsize=13, fontweight="bold")
+        ax.set_ylim(0.35, 0.90)
+        ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=9)
+        plt.tight_layout()
+        plt.savefig(FIGURES / "fig_probe_v2_transfer.png", dpi=300)
+        plt.close()
+
+    # Plot 4: The 4-Rung Reasoning Ladder (Direct -> Filler -> Scratchpad -> CoT)
+    fig, ax = plt.subplots(figsize=(10, 5.5))
+    modes_order = ["direct", "filler", "scratchpad", "cot"]
+    mode_colors = {"direct": "#7f7f7f", "filler": "#ff7f0e", "scratchpad": "#9467bd", "cot": "#2ca02c"}
+    mode_markers = {"direct": "o", "filler": "^", "scratchpad": "d", "cot": "s"}
+
+    for mode in modes_order:
+        sub_df = summary_df[summary_df["mode"] == mode].sort_values("model_size")
+        if not sub_df.empty:
+            ax.plot(
+                sub_df["model_size"], sub_df["auc_probe_70"],
+                marker=mode_markers.get(mode, "o"), color=mode_colors.get(mode, "blue"),
+                linewidth=2.2, markersize=8, label=f"{mode.capitalize()} Mode"
+            )
+
+    ax.axhline(0.5, color="black", linestyle="--", alpha=0.6, label="Chance (0.5)")
+    ax.set_xlabel("Model Parameters (Billions)", fontsize=12)
+    ax.set_ylabel("Probe Correctness AUROC @ 70% Depth", fontsize=12)
+    ax.set_title("The Reasoning-Structure Ladder: Direct vs. Filler vs. Scratchpad vs. CoT", fontsize=13, fontweight="bold")
+    ax.set_ylim(0.35, 0.90)
+    all_sizes = sorted(summary_df["model_size"].unique())
+    size_models = summary_df.drop_duplicates("model_size").sort_values("model_size")
+    ax.set_xticks(all_sizes)
+    ax.set_xticklabels([f"{m}\n({s}B)" for m, s in zip(size_models["model"], size_models["model_size"])], fontsize=10)
+    ax.legend(loc="upper left", fontsize=10, framealpha=0.9)
+    plt.tight_layout()
+    plt.savefig(FIGURES / "fig_reasoning_structure_ladder.png", dpi=300)
+    plt.close()
+
+    print("\nSaved figures to figures/fig_probe_v2_summary.png, fig_probe_v2_gap.png, fig_probe_v2_transfer.png, and fig_reasoning_structure_ladder.png", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Main Execution Entry Point
+# ---------------------------------------------------------------------------
+
+def main():
+    print("=" * 80, flush=True)
+    print("PROBE V2: RIGOROUS LINEAR PROBING & TRANSFER EVALUATION", flush=True)
+    print("=" * 80, flush=True)
+
+    npz_files = sorted(ACTIVATIONS.glob("internal_*.npz"))
+    if not npz_files:
+        npz_files = sorted(RESULTS.glob("internal_*.npz"))
+    if not npz_files:
+        print("No internal_*.npz files found. Run extract_v2.py first.", flush=True)
+        return
+
+    print(f"Found {len(npz_files)} NPZ activation files to analyze.", flush=True)
+
+    summary_rows = []
+    all_transfers = []
+    layer_curve_rows = []
+
+    for f in npz_files:
+        res, transfers = analyze_npz(f)
+        if res is not None:
+            curve_h = res.pop("curve_h")
+            curve_h_pre = res.pop("curve_h_pre")
+            summary_rows.append(res)
+
+            for l, (ah, ap) in enumerate(zip(curve_h, curve_h_pre)):
+                layer_curve_rows.append({
+                    "model": res["model"], "mode": res["mode"], "layer": l,
+                    "auroc_h": ah, "auroc_h_pre": ap,
+                })
+        if transfers:
+            all_transfers.extend(transfers)
+
+    summary_df = pd.DataFrame(summary_rows)
+    transfer_df = pd.DataFrame(all_transfers)
+    layer_df = pd.DataFrame(layer_curve_rows)
+
+    # Save CSVs to results/summary/
+    summary_df.to_csv(SUMMARY / "probe_v2_summary.csv", index=False)
+    summary_df.to_csv(RESULTS / "probe_v2_summary.csv", index=False)
+    if not transfer_df.empty:
+        transfer_df.to_csv(SUMMARY / "probe_v2_transfer.csv", index=False)
+        transfer_df.to_csv(RESULTS / "probe_v2_transfer.csv", index=False)
+    layer_df.to_csv(SUMMARY / "probe_v2_layer_curves.csv", index=False)
+    layer_df.to_csv(RESULTS / "probe_v2_layer_curves.csv", index=False)
+
+    print("\n" + "=" * 115, flush=True)
+    print("CONSOLIDATED DECISION RULE TABLE (DIRECT MODE)", flush=True)
+    print("=" * 115, flush=True)
+    cols = ["model", "model_size", "n_samples", "auc_verbalized", "auc_logit", "auc_probe_70", "ci_probe_70_low", "ci_probe_70_high", "mean_transfer_auc", "gap_p_value", "verdict"]
+    direct_view = summary_df[summary_df["mode"] == "direct"][cols].sort_values("model_size")
+    if not direct_view.empty:
+        print(direct_view.to_string(index=False), flush=True)
+
+    print("\n" + "=" * 115, flush=True)
+    print("THE REASONING-STRUCTURE LADDER: PROBE AUROC @ 70% DEPTH ACROSS MODES", flush=True)
+    print("=" * 115, flush=True)
+    ladder_pivot = summary_df.pivot(index="model", columns="mode", values="auc_probe_70")
+    ladder_cols = [c for c in ["direct", "filler", "scratchpad", "cot"] if c in ladder_pivot.columns]
+    ladder_pivot = ladder_pivot[ladder_cols]
+    print(ladder_pivot.to_string(), flush=True)
+
+    generate_plots(summary_df, transfer_df)
+
+
+if __name__ == "__main__":
+    main()

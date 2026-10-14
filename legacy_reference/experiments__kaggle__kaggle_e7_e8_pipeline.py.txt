@@ -1,0 +1,607 @@
+"""
+kaggle_e7_e8_pipeline.py  (v4 — Robust VRAM & Native Model Loading)
+===================================================================
+E7: 5 new model families (SmolLM2, Phi-3, Mistral)
+E8: 2 new datasets (ARC-Challenge, HellaSwag)
+
+Outputs saved to: /kaggle/working/results_e7_e8/
+"""
+
+# ============================================================
+# STEP 0: Install Dependencies
+# ============================================================
+import subprocess
+import sys
+
+def install(pkg):
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
+
+install("transformers>=4.43.0")
+install("accelerate>=0.30.0")
+install("bitsandbytes>=0.43.0")
+install("datasets")
+install("scipy")
+install("scikit-learn")
+
+# ============================================================
+# STEP 1: Imports
+# ============================================================
+import gc
+import json
+import os
+import random
+import re
+import traceback
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.multiprocessing as mp
+from datasets import load_dataset
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+)
+
+RESULTS_DIR = Path("/kaggle/working/results_e7_e8")
+CHECKPOINT_DIR = Path("/kaggle/working/checkpoints_e7_e8")
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+
+SEED              = 42
+N_CALIBRATION     = 200
+N_CONSISTENCY     = 100
+N_PARAPHRASES     = 5
+MAX_NEW_TOKENS    = 512
+BATCH_SIZE        = 8
+CONFIDENCE_SUFFIX = "\n\nConfidence (0-100): "
+SYSTEM_DIRECT     = "You are a precise question-answering assistant. Answer concisely and accurately."
+SYSTEM_COT        = "You are a precise question-answering assistant. Think step-by-step before giving your final answer."
+
+# ============================================================
+# STEP 2: Model Registry
+# ============================================================
+@dataclass
+class ModelConfig:
+    name: str
+    hf_id: str
+    size_b: float
+    use_4bit: bool
+    trust_remote: bool = False
+
+ALL_MODELS = [
+    ModelConfig("SmolLM2-360M",  "HuggingFaceTB/SmolLM2-360M-Instruct",  0.36, False, False),
+    ModelConfig("SmolLM2-1.7B",  "HuggingFaceTB/SmolLM2-1.7B-Instruct",  1.7,  False, False),
+    ModelConfig("Phi-3-mini",    "microsoft/Phi-3-mini-4k-instruct",       3.8,  False, False),
+    ModelConfig("Phi-3.5-mini",  "microsoft/Phi-3.5-mini-instruct",        3.8,  False, False),
+    ModelConfig("Mistral-7B",    "mistralai/Mistral-7B-Instruct-v0.3",     7.0,  True,  False),
+]
+
+# Split models across 2 GPUs
+GPU0_MODELS = ["SmolLM2-360M", "SmolLM2-1.7B", "Phi-3-mini"]
+GPU1_MODELS = ["Phi-3.5-mini", "Mistral-7B"]
+
+# ============================================================
+# STEP 3: Datasets (E8)
+# ============================================================
+def load_arc_challenge(n=N_CALIBRATION, seed=SEED):
+    print("[data] Loading ARC-Challenge...")
+    ds = load_dataset("ai2_arc", "ARC-Challenge", split="test")
+    random.seed(seed)
+    indices = random.sample(range(len(ds)), min(n, len(ds)))
+    samples = []
+    for i in indices:
+        row = ds[i]
+        choices = row["choices"]["text"]
+        labels  = row["choices"]["label"]
+        key = row["answerKey"]
+        answer_letter = key if key in "ABCD" else chr(64 + int(key))
+        samples.append({
+            "id": f"arc_{i}", "question": row["question"],
+            "choices": choices, "labels": labels,
+            "answer": answer_letter, "dataset": "arc_challenge",
+        })
+    print(f"[data] ARC-Challenge: {len(samples)} samples")
+    return samples
+
+def load_hellaswag(n=N_CALIBRATION, seed=SEED):
+    print("[data] Loading HellaSwag...")
+    ds = load_dataset("Rowan/hellaswag", split="validation")
+    random.seed(seed)
+    indices = random.sample(range(len(ds)), min(n, len(ds)))
+    samples = []
+    for i in indices:
+        row = ds[i]
+        endings = row["endings"]
+        label = int(row["label"])
+        samples.append({
+            "id": f"hella_{i}",
+            "question": row["activity_label"] + ": " + row["ctx"],
+            "choices": endings, "labels": ["A", "B", "C", "D"][:len(endings)],
+            "answer": chr(65 + label), "dataset": "hellaswag",
+        })
+    print(f"[data] HellaSwag: {len(samples)} samples")
+    return samples
+
+def load_all_datasets():
+    return {
+        "arc_challenge": load_arc_challenge(),
+        "hellaswag":     load_hellaswag(),
+    }
+
+# ============================================================
+# STEP 4: Prompts & Parsing
+# ============================================================
+def make_prompt(question, choices, labels, mode):
+    system = SYSTEM_COT if mode == "cot" else SYSTEM_DIRECT
+    opts = "\n".join(f"  {l}. {c}" for l, c in zip(labels, choices))
+    user = f"{question}\n\nOptions:\n{opts}\n\nAnswer with just the letter (A/B/C/D)."
+    user += CONFIDENCE_SUFFIX
+    return system, user
+
+def format_messages(system, user, tokenizer):
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user",   "content": user}
+    ]
+    try:
+        return tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+    except Exception:
+        return f"{system}\n\nUser: {user}\nAssistant:"
+
+def parse_confidence(text):
+    matches = re.findall(r'\b(\d{1,3})\b', text[-200:])
+    for m in reversed(matches):
+        val = int(m)
+        if 0 <= val <= 100:
+            return val / 100.0
+    return None
+
+def parse_mcq(text):
+    matches = re.findall(r'\b([A-D])\b', text[-300:])
+    if matches:
+        return matches[-1]
+    matches = re.findall(r'\b([A-D])\b', text)
+    return matches[0] if matches else ""
+
+# ============================================================
+# STEP 5: Batched Generation
+# ============================================================
+def generate_batch(model, tokenizer, prompts, max_new_tokens, device):
+    tokenizer.padding_side = "left"
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    encodings = tokenizer(
+        prompts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=2048,
+    )
+    encodings = {k: v.to(device) for k, v in encodings.items()}
+
+    with torch.no_grad():
+        output_ids = model.generate(
+            **encodings,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=tokenizer.pad_token_id,
+        )
+
+    responses = []
+    input_lens = encodings["input_ids"].shape[1]
+    for i in range(len(prompts)):
+        new_tokens = output_ids[i][input_lens:]
+        response = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+        responses.append(response)
+    return responses
+
+# ============================================================
+# STEP 6: Model Loading & Cleanup
+# ============================================================
+def load_model(config, device):
+    print(f"[load] {config.name} on {device}...")
+    hf_token = os.environ.get("HF_TOKEN", None)
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        config.hf_id,
+        token=hf_token,
+        trust_remote_code=config.trust_remote
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    if config.use_4bit:
+        bnb = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_use_double_quant=True,
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            config.hf_id,
+            quantization_config=bnb,
+            device_map={"": device},
+            token=hf_token,
+            trust_remote_code=config.trust_remote,
+            low_cpu_mem_usage=True,
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            config.hf_id,
+            torch_dtype=torch.float16,
+            token=hf_token,
+            trust_remote_code=config.trust_remote,
+            low_cpu_mem_usage=True,
+            attn_implementation="eager",
+        ).to(device)
+
+    model.eval()
+    if "cuda" in str(device):
+        dev_idx = int(str(device).split(":")[-1])
+        vram = torch.cuda.memory_allocated(dev_idx) / 1e9
+        print(f"[load] {config.name} ready on GPU {dev_idx}. VRAM: {vram:.2f} GB")
+    return model, tokenizer
+
+def free_model(model, tokenizer):
+    del model, tokenizer
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
+# ============================================================
+# STEP 7: Calibration (Batched)
+# ============================================================
+def run_calibration(config, model, tokenizer, samples, dataset_name, mode, device):
+    cp_path = CHECKPOINT_DIR / f"{config.name}_{dataset_name}_{mode}_calib.json"
+    if cp_path.exists():
+        print(f"    [skip] {dataset_name}/{mode} calib (cached)")
+        with open(cp_path) as f:
+            return json.load(f)
+
+    print(f"    {dataset_name}/{mode} calib ({len(samples)} samples, batch={BATCH_SIZE})...")
+    rows = []
+    batches = [samples[i:i+BATCH_SIZE] for i in range(0, len(samples), BATCH_SIZE)]
+
+    for b_idx, batch in enumerate(batches):
+        if b_idx % 5 == 0:
+            print(f"      batch {b_idx+1}/{len(batches)}")
+        try:
+            prompts = []
+            for s in batch:
+                sys_msg, user_msg = make_prompt(s["question"], s["choices"], s["labels"], mode)
+                prompts.append(format_messages(sys_msg, user_msg, tokenizer))
+
+            responses = generate_batch(model, tokenizer, prompts, MAX_NEW_TOKENS, device)
+
+            for s, response in zip(batch, responses):
+                predicted  = parse_mcq(response)
+                confidence = parse_confidence(response)
+                correct    = (predicted.upper() == s["answer"].upper())
+                rows.append({
+                    "model": config.name, "size_b": config.size_b,
+                    "mode": mode, "dataset": dataset_name,
+                    "id": s["id"], "answer": s["answer"],
+                    "predicted": predicted, "confidence": confidence,
+                    "correct": correct, "raw_response": response[:300],
+                })
+        except Exception as e:
+            print(f"      ✗ Batch {b_idx} failed: {e}")
+            for s in batch:
+                rows.append({
+                    "model": config.name, "size_b": config.size_b,
+                    "mode": mode, "dataset": dataset_name,
+                    "id": s["id"], "answer": s["answer"],
+                    "predicted": "", "confidence": None,
+                    "correct": False, "raw_response": str(e)[:100],
+                })
+
+    with open(cp_path, "w") as f:
+        json.dump(rows, f)
+
+    n_correct = sum(1 for r in rows if r["correct"])
+    print(f"      ✓ Done: {len(rows)} rows, correct: {n_correct}/{len(rows)}")
+    return rows
+
+# ============================================================
+# STEP 8: Consistency (Batched)
+# ============================================================
+def make_paraphrases(sample, seed=0):
+    choices = sample["choices"]
+    labels  = sample["labels"]
+    variants = [{
+        "choices": choices,
+        "labels": labels,
+        "paraphrase_idx": 0,
+        "orig_indices": list(range(len(choices)))
+    }]
+    for pi in range(N_PARAPHRASES):
+        rng = random.Random(seed * 100 + pi)
+        idxs = list(range(len(choices)))
+        rng.shuffle(idxs)
+        variants.append({
+            "choices": [choices[i] for i in idxs],
+            "labels": ["A", "B", "C", "D"][:len(choices)],
+            "paraphrase_idx": pi + 1,
+            "orig_indices": idxs,
+        })
+    return variants
+
+def run_consistency(config, model, tokenizer, samples, dataset_name, mode, device):
+    cp_path = CHECKPOINT_DIR / f"{config.name}_{dataset_name}_{mode}_consist.json"
+    if cp_path.exists():
+        print(f"    [skip] {dataset_name}/{mode} consistency (cached)")
+        with open(cp_path) as f:
+            return json.load(f)
+
+    subset = samples[:N_CONSISTENCY]
+    print(f"    {dataset_name}/{mode} consistency ({len(subset)}q × {N_PARAPHRASES+1} variants, batch={BATCH_SIZE})...")
+    rows = []
+
+    all_items = []
+    for q_idx, sample in enumerate(subset):
+        for variant in make_paraphrases(sample, seed=q_idx):
+            all_items.append((sample, variant))
+
+    batches = [all_items[i:i+BATCH_SIZE] for i in range(0, len(all_items), BATCH_SIZE)]
+
+    for b_idx, batch in enumerate(batches):
+        if b_idx % 10 == 0:
+            print(f"      batch {b_idx+1}/{len(batches)}")
+        try:
+            prompts = []
+            for sample, variant in batch:
+                sys_msg, user_msg = make_prompt(
+                    sample["question"], variant["choices"], variant["labels"], mode
+                )
+                prompts.append(format_messages(sys_msg, user_msg, tokenizer))
+
+            responses = generate_batch(model, tokenizer, prompts, 64, device)
+
+            for (sample, variant), response in zip(batch, responses):
+                predicted = parse_mcq(response)
+                if predicted in "ABCD":
+                    pred_idx = ord(predicted) - 65
+                    orig_indices = variant.get("orig_indices", list(range(4)))
+                    if pred_idx < len(orig_indices):
+                        predicted = chr(65 + orig_indices[pred_idx])
+
+                rows.append({
+                    "model": config.name, "size_b": config.size_b,
+                    "mode": mode, "dataset": dataset_name,
+                    "question_id": sample["id"],
+                    "paraphrase_idx": variant["paraphrase_idx"],
+                    "answer": sample["answer"], "predicted": predicted,
+                })
+        except Exception as e:
+            print(f"      ✗ Batch {b_idx} failed: {e}")
+
+    with open(cp_path, "w") as f:
+        json.dump(rows, f)
+    print(f"      ✓ Done: {len(rows)} consistency rows")
+    return rows
+
+# ============================================================
+# STEP 9: GPU Worker Function
+# ============================================================
+def run_worker(gpu_id, model_names, all_datasets):
+    device = f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu"
+    if torch.cuda.is_available():
+        torch.cuda.set_device(gpu_id)
+
+    print(f"\n[GPU {gpu_id}] Worker online. Assigned models: {model_names}")
+    worker_calib = []
+    worker_consist = []
+
+    for config in ALL_MODELS:
+        if config.name not in model_names:
+            continue
+
+        print(f"\n[GPU {gpu_id}] ====== {config.name} ({config.size_b}B) ======")
+        done_flag = CHECKPOINT_DIR / f"{config.name}_DONE.flag"
+        if done_flag.exists():
+            print(f"[GPU {gpu_id}] {config.name} already done — loading cached data")
+            for ds_name in all_datasets:
+                for mode in ["direct", "cot"]:
+                    calib_cp = CHECKPOINT_DIR / f"{config.name}_{ds_name}_{mode}_calib.json"
+                    if calib_cp.exists():
+                        with open(calib_cp) as f:
+                            worker_calib.extend(json.load(f))
+                    consist_cp = CHECKPOINT_DIR / f"{config.name}_{ds_name}_{mode}_consist.json"
+                    if consist_cp.exists():
+                        with open(consist_cp) as f:
+                            worker_consist.extend(json.load(f))
+            continue
+
+        try:
+            model, tokenizer = load_model(config, device)
+        except Exception as e:
+            print(f"[GPU {gpu_id}] ✗ Model load failed: {e}")
+            traceback.print_exc()
+            continue
+
+        for ds_name, samples in all_datasets.items():
+            for mode in ["direct", "cot"]:
+                try:
+                    rows = run_calibration(config, model, tokenizer, samples, ds_name, mode, device)
+                    worker_calib.extend(rows)
+                except Exception as e:
+                    print(f"[GPU {gpu_id}] ✗ Calib {ds_name}/{mode}: {e}")
+
+                try:
+                    rows = run_consistency(config, model, tokenizer, samples, ds_name, mode, device)
+                    worker_consist.extend(rows)
+                except Exception as e:
+                    print(f"[GPU {gpu_id}] ✗ Consistency {ds_name}/{mode}: {e}")
+
+        free_model(model, tokenizer)
+        done_flag.touch()
+        print(f"[GPU {gpu_id}] ✓ {config.name} completed successfully")
+
+    # Save worker outputs
+    if worker_calib:
+        pd.DataFrame(worker_calib).to_csv(RESULTS_DIR / f"calib_gpu{gpu_id}.csv", index=False)
+    if worker_consist:
+        pd.DataFrame(worker_consist).to_csv(RESULTS_DIR / f"consist_gpu{gpu_id}.csv", index=False)
+
+    print(f"[GPU {gpu_id}] Worker finished. Calib: {len(worker_calib)}, Consist: {len(worker_consist)}")
+
+# ============================================================
+# STEP 10: Metrics & Summaries
+# ============================================================
+def compute_ece(confs, outs, n_bins=10):
+    confs, outs = np.array(confs, dtype=float), np.array(outs, dtype=float)
+    n = len(confs)
+    if n == 0:
+        return 0.0
+    ece = 0.0
+    bin_edges = np.linspace(0, 1, n_bins + 1)
+    for i in range(n_bins):
+        lo, hi = bin_edges[i], bin_edges[i+1]
+        mask = (confs >= lo) & (confs <= hi if i == n_bins - 1 else confs < hi)
+        if mask.sum() == 0:
+            continue
+        ece += (mask.sum() / n) * abs(outs[mask].mean() - confs[mask].mean())
+    return round(float(ece), 4)
+
+def compute_brier(confs, outs):
+    if len(confs) == 0:
+        return 0.0
+    return round(float(np.mean((np.array(confs) - np.array(outs))**2)), 4)
+
+def compute_summaries(calib_df, consist_df):
+    acc = (
+        calib_df.groupby(["model", "size_b", "mode", "dataset"])
+        .agg(accuracy=("correct", "mean"), n=("correct", "count"))
+        .reset_index()
+    )
+    acc["accuracy"] = acc["accuracy"].round(4)
+
+    ece_rows = []
+    for (model, size_b, mode, dataset), g in calib_df.groupby(["model", "size_b", "mode", "dataset"]):
+        valid = g.dropna(subset=["confidence"])
+        if len(valid) < 5:
+            continue
+        ece_rows.append({
+            "model": model, "size_b": size_b, "mode": mode, "dataset": dataset,
+            "ece":   compute_ece(valid["confidence"], valid["correct"]),
+            "brier": compute_brier(valid["confidence"], valid["correct"]),
+            "mean_confidence": round(float(valid["confidence"].mean()), 4),
+            "n_valid": len(valid),
+        })
+    ece_df = pd.DataFrame(ece_rows)
+
+    consist_rows = []
+    delta_rows = []
+    if len(consist_df) > 0:
+        for (model, size_b, mode, dataset), g in consist_df.groupby(["model", "size_b", "mode", "dataset"]):
+            rate = (
+                g.groupby("question_id")
+                 .apply(lambda q: (q["predicted"] == q["answer"]).mean())
+                 .mean()
+            )
+            consist_rows.append({
+                "model": model, "size_b": size_b, "mode": mode,
+                "dataset": dataset, "consistency": round(float(rate), 4),
+            })
+        consist_summary = pd.DataFrame(consist_rows)
+
+        for (model, size_b, dataset), grp in consist_summary.groupby(["model", "size_b", "dataset"]):
+            d = grp[grp["mode"] == "direct"]["consistency"].values
+            c = grp[grp["mode"] == "cot"]["consistency"].values
+            if len(d) and len(c):
+                delta_rows.append({
+                    "model": model, "size_b": size_b, "dataset": dataset,
+                    "delta": round(float(c[0] - d[0]), 6),
+                    "cot_consistency": round(float(c[0]), 4),
+                    "direct_consistency": round(float(d[0]), 4),
+                })
+    else:
+        consist_summary = pd.DataFrame()
+
+    delta_df = pd.DataFrame(delta_rows)
+    return acc, ece_df, consist_summary, delta_df
+
+# ============================================================
+# STEP 11: Main Execution
+# ============================================================
+def main():
+    n_gpus = torch.cuda.device_count()
+    print(f"\n=======================================================")
+    print(f"E7+E8 PIPELINE: Detected {n_gpus} GPUs")
+    print(f"=======================================================")
+
+    print("\nLoading datasets on main process...")
+    all_datasets = load_all_datasets()
+
+    if n_gpus >= 2:
+        print("\nSpawning 2 GPU worker processes...")
+        print(f"  GPU 0 models: {GPU0_MODELS}")
+        print(f"  GPU 1 models: {GPU1_MODELS}")
+
+        ctx = mp.get_context("spawn")
+        p0 = ctx.Process(target=run_worker, args=(0, GPU0_MODELS, all_datasets))
+        p1 = ctx.Process(target=run_worker, args=(1, GPU1_MODELS, all_datasets))
+
+        p0.start()
+        p1.start()
+
+        p0.join()
+        p1.join()
+
+        print("\nAll GPU workers have completed.")
+    else:
+        print("\nSingle GPU environment — running all models sequentially on cuda:0")
+        run_worker(0, [m.name for m in ALL_MODELS], all_datasets)
+
+    # Merge results
+    print("\nMerging worker results...")
+    calib_parts = list(RESULTS_DIR.glob("calib_gpu*.csv"))
+    consist_parts = list(RESULTS_DIR.glob("consist_gpu*.csv"))
+
+    if not calib_parts:
+        print("✗ No calibration output files found!")
+        return
+
+    calib_df = pd.concat([pd.read_csv(f) for f in calib_parts], ignore_index=True)
+    consist_df = pd.concat([pd.read_csv(f) for f in consist_parts], ignore_index=True) if consist_parts else pd.DataFrame()
+
+    calib_df.to_csv(RESULTS_DIR / "calibration_raw_e7_e8.csv", index=False)
+    if len(consist_df):
+        consist_df.to_csv(RESULTS_DIR / "consistency_raw_e7_e8.csv", index=False)
+
+    acc, ece_df, consist_summary, delta_df = compute_summaries(calib_df, consist_df)
+
+    acc.to_csv(RESULTS_DIR / "accuracy_summary_e7_e8.csv", index=False)
+    ece_df.to_csv(RESULTS_DIR / "calibration_ece_e7_e8.csv", index=False)
+    if len(consist_summary):
+        consist_summary.to_csv(RESULTS_DIR / "consistency_summary_e7_e8.csv", index=False)
+    if len(delta_df):
+        delta_df.to_csv(RESULTS_DIR / "consistency_delta_e7_e8.csv", index=False)
+
+    print("\n" + "="*60)
+    print("ECE RESULTS (New Models)")
+    print("="*60)
+    print(ece_df.to_string(index=False))
+
+    print("\n" + "="*60)
+    print("ACCURACY SUMMARY")
+    print("="*60)
+    print(acc.to_string(index=False))
+
+    print("\n" + "="*60)
+    print(f"COMPLETED! Results saved to: {RESULTS_DIR}")
+    for f in sorted(RESULTS_DIR.iterdir()):
+        print(f"  {f.name} ({f.stat().st_size/1024:.1f} KB)")
+    print("="*60)
+
+if __name__ == "__main__":
+    main()

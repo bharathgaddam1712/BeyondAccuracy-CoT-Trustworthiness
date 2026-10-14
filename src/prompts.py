@@ -1,113 +1,22 @@
-"""
-Prompt templates for Paper A — Beyond Accuracy.
-Three evaluation axes:
-  1. Accuracy      — direct answer vs chain-of-thought
-  2. Calibration   — same prompts + confidence elicitation suffix
-  3. Consistency   — paraphrase variants of the same question
-"""
-
-# ---------------------------------------------------------------------------
-# Confidence elicitation suffix (appended for calibration axis)
-# ---------------------------------------------------------------------------
-
-CONFIDENCE_SUFFIX = "\nConfidence: <0-100>"
-
-
-# ---------------------------------------------------------------------------
-# System prompts
-# ---------------------------------------------------------------------------
-
-SYSTEM_DIRECT = (
-    "You are a helpful assistant. Answer the question concisely. "
-    "Give only the final answer with no explanation."
-)
-
-SYSTEM_COT = (
-    "You are a helpful assistant. Think step by step before giving your final answer. "
-    "End your response with 'Answer: <your answer>'."
-)
-
-
-# ---------------------------------------------------------------------------
-# Dataset-specific message builders
-# ---------------------------------------------------------------------------
-
-def _gsm8k_messages(question: str, mode: str) -> list[dict]:
-    if mode == "cot":
-        return [
-            {"role": "system", "content": SYSTEM_COT},
-            {"role": "user",   "content": f"Question: {question}"},
-        ]
-    return [
-        {"role": "system", "content": SYSTEM_DIRECT},
-        {"role": "user",   "content": f"Question: {question}\nAnswer:"},
-    ]
-
-
-def _bbh_messages(question: str, mode: str) -> list[dict]:
-    if mode == "cot":
-        return [
-            {"role": "system", "content": SYSTEM_COT},
-            {"role": "user",   "content": f"Question: {question}"},
-        ]
-    return [
-        {"role": "system", "content": SYSTEM_DIRECT},
-        {"role": "user",   "content": f"Question: {question}\nAnswer:"},
-    ]
-
-
-def _truthfulqa_messages(question: str, mode: str, choices: list[str] | None) -> list[dict]:
-    choices = choices or []
-    choices_str = "\n".join(f"{chr(65+i)}. {c}" for i, c in enumerate(choices))
-    if mode == "cot":
-        return [
-            {"role": "system", "content": SYSTEM_COT},
-            {"role": "user",   "content": f"Question: {question}\n{choices_str}"},
-        ]
-    return [
-        {"role": "system", "content": SYSTEM_DIRECT},
-        {"role": "user",   "content": f"Question: {question}\n{choices_str}\nAnswer (letter only):"},
-    ]
-
-
-_DATASET_BUILDERS = {
-    "gsm8k":      lambda q, mode, choices=None: _gsm8k_messages(q, mode),
-    "bbh":        lambda q, mode, choices=None: _bbh_messages(q, mode),
-    "truthfulqa": lambda q, mode, choices=None: _truthfulqa_messages(q, mode, choices),
-}
-
-
-# ---------------------------------------------------------------------------
-# Public API — called directly by the notebooks
-# ---------------------------------------------------------------------------
-
-def make_accuracy_prompt(question: str, mode: str, dataset: str, choices: list[str] | None = None) -> list[dict]:
-    """Direct or CoT prompt for the accuracy axis (Step 2)."""
-    return _DATASET_BUILDERS[dataset](question, mode, choices)
-
-
-def make_calibration_prompt(question: str, mode: str, dataset: str, choices: list[str] | None = None) -> list[dict]:
-    """Accuracy prompt + verbalized confidence elicitation suffix (Step 3)."""
-    msgs = [m.copy() for m in make_accuracy_prompt(question, mode, dataset, choices)]
-    for i in reversed(range(len(msgs))):
-        if msgs[i]["role"] == "user":
-            msgs[i]["content"] = msgs[i]["content"] + CONFIDENCE_SUFFIX
-            break
-    return msgs
-
-
-def make_consistency_prompt(question: str, mode: str, dataset: str, choices: list[str] | None = None) -> list[dict]:
-    """Same as accuracy prompt — used to re-run paraphrase variants (Step 4)."""
-    return make_accuracy_prompt(question, mode, dataset, choices)
-
-
-def make_paraphrase_gen_prompt(question: str) -> list[dict]:
-    """Ask a model to generate 5 numbered paraphrases of a question (Step 1)."""
-    return [
-        {"role": "system", "content": (
-            "You are a paraphrasing assistant. Given a question, generate 5 paraphrases "
-            "that preserve the exact meaning but vary the wording, style, and phrasing. "
-            "Output exactly 5 lines, numbered 1-5, one paraphrase per line, nothing else."
-        )},
-        {"role": "user", "content": f"Original question: {question}\n\nGenerate 5 paraphrases:"},
-    ]
+"""Versioned prompts shared by every experiment. No conflicting instructions."""
+PROMPT_VERSION="explicit-fields-v3"
+SYSTEM_DIRECT="Answer the question without an explanation."
+SYSTEM_COT="Reason step by step, then give the final answer."
+CONFIDENCE_SUFFIX="Report your probability that the final answer is correct as a percentage from 0 to 100."
+def question_text(question,choices=None):
+    return question+("\nChoices:\n"+"\n".join(f"({chr(65+i)}) {c}" for i,c in enumerate(choices)) if choices else "")
+def make_prompt(question,mode,dataset,choices=None,confidence=False,trace=None):
+    instructions=SYSTEM_COT if mode in ("cot","scratchpad") else SYSTEM_DIRECT
+    if mode=="scratchpad":instructions="Put reasoning inside <scratchpad>...</scratchpad>, then give the final answer outside the tags."
+    if trace is not None:instructions="Use the provided text as context, then answer the original question. Do not repeat the provided text."
+    answer_format="a numeric value only" if dataset=="gsm8k" else ("a choice letter only" if choices else "the requested short answer only")
+    instructions+=f"\nEnd with a separate line: Answer: <{answer_format}>."
+    if confidence:instructions+="\n"+CONFIDENCE_SUFFIX+"\nAfter Answer, write a separate line: Confidence: <percentage>."
+    body="Question:\n"+question_text(question,choices)
+    if trace is not None:body+="\n\nProvided text:\n"+trace
+    return [dict(role="system",content=instructions),dict(role="user",content=body)]
+def make_accuracy_prompt(question,mode,dataset,choices=None):return make_prompt(question,mode,dataset,choices)
+def make_calibration_prompt(question,mode,dataset,choices=None):return make_prompt(question,mode,dataset,choices,confidence=True)
+make_consistency_prompt=make_accuracy_prompt
+def make_paraphrase_gen_prompt(question):
+    return [dict(role="system",content="Rewrite the question in five different ways. Preserve every number, entity, condition, negation, unit and requested quantity. Do not solve it or add facts. Return only a JSON array of five complete question strings."),dict(role="user",content=question)]

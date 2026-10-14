@@ -1,0 +1,536 @@
+"""
+kaggle_gated_e1_e3_e4_pipeline.py
+==================================
+Runs the 4 Gated Models (Llama-3.2-1B, Gemma-2-2B, Llama-3.2-3B, Llama-3.1-8B)
+across 2x T4 GPUs for:
+  - E1: Logit-derived calibration (mean top-1 prob vs verbalized)
+  - E3: Token-by-token entropy dynamics
+  - E4: Filler-CoT (length-vs-reasoning control)
+
+GPU 0: Llama-3.2-1B, Gemma-2-2B
+GPU 1: Llama-3.2-3B, Llama-3.1-8B (4-bit)
+
+Outputs saved to: /kaggle/working/results_gated/
+"""
+
+# ============================================================
+# STEP 0: Dependencies
+# ============================================================
+import subprocess
+import sys
+
+def install(pkg):
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
+
+install("transformers>=4.43.0")
+install("accelerate>=0.30.0")
+install("bitsandbytes>=0.43.0")
+install("datasets")
+install("scipy")
+install("scikit-learn")
+
+# ============================================================
+# STEP 1: Imports
+# ============================================================
+import gc
+import json
+import os
+import random
+import re
+import string
+import traceback
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.multiprocessing as mp
+from datasets import load_dataset
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+)
+
+RESULTS_DIR = Path("/kaggle/working/results_gated")
+CHECKPOINT_DIR = Path("/kaggle/working/checkpoints_gated")
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+
+SEED              = 42
+MAX_NEW_TOKENS    = 512
+CONFIDENCE_SUFFIX = "\nConfidence: <0-100>"
+
+SYSTEM_DIRECT = (
+    "You are a helpful assistant. Answer the question concisely. "
+    "Give only the final answer with no explanation."
+)
+SYSTEM_COT = (
+    "You are a helpful assistant. Think step by step before giving your final answer. "
+    "End your response with 'Answer: <your answer>'."
+)
+SYSTEM_FILLER = (
+    "You are a helpful assistant. Before answering, share your general thoughts "
+    "and associations about the topic. Reflect broadly on what comes to mind, "
+    "then give your final answer. End your response with 'Answer: <your answer>'."
+)
+
+# ============================================================
+# STEP 2: Model Registry
+# ============================================================
+@dataclass
+class ModelConfig:
+    name: str
+    hf_id: str
+    size_b: float
+    use_4bit: bool
+
+ALL_GATED_MODELS = [
+    ModelConfig("Llama-3.2-1B",  "meta-llama/Llama-3.2-1B-Instruct",       1.0, False),
+    ModelConfig("Gemma-2-2B",    "google/gemma-2-2b-it",                    2.0, False),
+    ModelConfig("Llama-3.2-3B",  "meta-llama/Llama-3.2-3B-Instruct",       3.0, False),
+    ModelConfig("Llama-3.1-8B",  "meta-llama/Meta-Llama-3.1-8B-Instruct",  8.0, True),
+]
+
+GPU0_MODELS = ["Llama-3.2-1B", "Gemma-2-2B"]
+GPU1_MODELS = ["Llama-3.2-3B", "Llama-3.1-8B"]
+
+# ============================================================
+# STEP 3: Datasets (GSM8K, BBH, TruthfulQA)
+# ============================================================
+def load_gsm8k(n=200, seed=SEED):
+    print("[data] Loading GSM8K...")
+    ds = load_dataset("openai/gsm8k", "main", split="test")
+    random.seed(seed)
+    indices = random.sample(range(len(ds)), min(n, len(ds)))
+    return [
+        {
+            "id": f"gsm8k_{i}",
+            "question": ds[i]["question"],
+            "answer": ds[i]["answer"].split("####")[-1].strip().replace(",", ""),
+            "dataset": "gsm8k",
+        }
+        for i in indices
+    ]
+
+def load_bbh(n_per_subtask=60, seed=SEED):
+    print("[data] Loading BBH...")
+    subtasks = [
+        "logical_deduction_three_objects",
+        "causal_judgement",
+        "date_understanding",
+    ]
+    random.seed(seed)
+    all_samples = []
+    for task in subtasks:
+        try:
+            ds = load_dataset("lukaemon/bbh", task, split="test")
+            indices = random.sample(range(len(ds)), min(n_per_subtask, len(ds)))
+            for i in indices:
+                all_samples.append({
+                    "id": f"bbh_{task}_{i}",
+                    "question": ds[i]["input"],
+                    "answer": ds[i]["target"].strip(),
+                    "dataset": "bbh",
+                    "subtask": task,
+                })
+        except Exception as e:
+            print(f"[data] Warning loading {task}: {e}")
+    return all_samples
+
+def load_truthfulqa(n=200, seed=SEED):
+    print("[data] Loading TruthfulQA...")
+    ds = load_dataset("truthfulqa/truthful_qa", "multiple_choice", split="validation")
+    random.seed(seed)
+    indices = random.sample(range(len(ds)), min(n, len(ds)))
+    samples = []
+    for i in indices:
+        row = ds[i]
+        choices = row["mc1_targets"]["choices"]
+        labels = row["mc1_targets"]["labels"]
+        paired = list(zip(choices, labels))
+        random.shuffle(paired)
+        shuffled_choices, shuffled_labels = zip(*paired)
+        correct_letter = chr(65 + shuffled_labels.index(1))
+        samples.append({
+            "id": f"tqa_{i}",
+            "question": row["question"],
+            "choices": list(shuffled_choices),
+            "answer": correct_letter,
+            "dataset": "truthfulqa",
+        })
+    return samples
+
+def load_all_datasets():
+    return {
+        "gsm8k": load_gsm8k(200),
+        "bbh": load_bbh(60),
+        "truthfulqa": load_truthfulqa(200),
+    }
+
+# ============================================================
+# STEP 4: Prompt Construction & Parsing
+# ============================================================
+def make_prompt_messages(question, mode, dataset, choices=None):
+    if mode == "filler":
+        if dataset == "truthfulqa" and choices:
+            choices_str = "\n".join(f"{chr(65+i)}. {c}" for i, c in enumerate(choices))
+            content = f"Question: {question}\n{choices_str}\n{CONFIDENCE_SUFFIX}"
+        else:
+            content = f"Question: {question}\n{CONFIDENCE_SUFFIX}"
+        return [
+            {"role": "system", "content": SYSTEM_FILLER},
+            {"role": "user", "content": content},
+        ]
+
+    system = SYSTEM_COT if mode == "cot" else SYSTEM_DIRECT
+    if dataset == "truthfulqa" and choices:
+        choices_str = "\n".join(f"{chr(65+i)}. {c}" for i, c in enumerate(choices))
+        suffix = "\nAnswer (letter only):" if mode == "direct" else ""
+        content = f"Question: {question}\n{choices_str}{suffix}\n{CONFIDENCE_SUFFIX}"
+    else:
+        suffix = "\nAnswer:" if mode == "direct" else ""
+        content = f"Question: {question}{suffix}\n{CONFIDENCE_SUFFIX}"
+
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": content},
+    ]
+
+def format_messages(messages, tokenizer):
+    try:
+        return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    except Exception:
+        sys_txt = messages[0]["content"]
+        user_txt = messages[1]["content"]
+        return f"{sys_txt}\n\nUser: {user_txt}\nAssistant:"
+
+def normalize_answer(s: str) -> str:
+    s = s.lower().strip()
+    s = re.sub(r'\b(a|an|the)\b', ' ', s)
+    s = ''.join(c for c in s if c not in string.punctuation)
+    return ' '.join(s.split())
+
+def parse_gsm8k_answer(response: str):
+    m = re.search(r'####\s*([+-]?\d[\d,\.]*)', response)
+    if m:
+        return m.group(1).replace(',', '').strip()
+    nums = re.findall(r'Answer:\s*([+-]?\d[\d,\.]*)', response, re.IGNORECASE)
+    if nums:
+        return nums[-1].replace(',', '').strip()
+    all_nums = re.findall(r'[+-]?\d[\d,\.]*', response)
+    return all_nums[-1].replace(',', '') if all_nums else None
+
+def parse_bbh_answer(response: str):
+    m = re.search(r'[Aa]nswer[:\s]+(.+)', response)
+    if m:
+        return normalize_answer(m.group(1).split('\n')[0])
+    lines = [l.strip() for l in response.strip().split('\n') if l.strip()]
+    return normalize_answer(lines[-1]) if lines else None
+
+def parse_truthfulqa_answer(response: str):
+    m = re.search(r'\b([A-D])\b', response.upper())
+    return m.group(1) if m else None
+
+def parse_answer(response, dataset):
+    if dataset == "gsm8k":
+        return parse_gsm8k_answer(response)
+    elif dataset == "bbh":
+        return parse_bbh_answer(response)
+    elif dataset == "truthfulqa":
+        return parse_truthfulqa_answer(response)
+    return response.strip() if response else None
+
+def parse_confidence(response: str):
+    m = re.search(r'[Cc]onfidence[:\s]+(\d+)', response)
+    if m:
+        return max(0.0, min(100.0, int(m.group(1)))) / 100.0
+    nums = re.findall(r'\b(\d{1,3})\b', response[-200:])
+    if nums:
+        v = int(nums[-1])
+        if 0 <= v <= 100:
+            return v / 100.0
+    return None
+
+def check_answer(predicted, gold):
+    if predicted is None or gold is None:
+        return False
+    return str(predicted).strip().lower() == str(gold).strip().lower()
+
+# ============================================================
+# STEP 5: Diagnostics Generation (E1 + E3)
+# ============================================================
+@torch.no_grad()
+def generate_full_diagnostics(model, tokenizer, messages, device, max_new_tokens=MAX_NEW_TOKENS):
+    text = format_messages(messages, tokenizer)
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=2048)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    input_len = inputs["input_ids"].shape[1]
+
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        temperature=1.0,
+        output_scores=True,
+        return_dict_in_generate=True,
+        pad_token_id=tokenizer.eos_token_id,
+    )
+
+    generated_ids = outputs.sequences[0, input_len:]
+    response_text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+
+    entropies = []
+    top1_probs = []
+    margins = []
+
+    for score in outputs.scores:
+        probs = torch.softmax(score[0], dim=-1)
+        log_probs = torch.log(probs + 1e-10)
+        entropy = -(probs * log_probs).sum().item()
+        entropies.append(entropy)
+
+        sorted_probs, _ = probs.sort(descending=True)
+        top1_probs.append(sorted_probs[0].item())
+        if len(sorted_probs) > 1:
+            margins.append((sorted_probs[0] - sorted_probs[1]).item())
+        else:
+            margins.append(sorted_probs[0].item())
+
+    return {
+        "text": response_text,
+        "entropies": entropies,
+        "first_token_entropy": entropies[0] if entropies else None,
+        "mean_entropy": float(np.mean(entropies)) if entropies else None,
+        "mean_top1_prob": float(np.mean(top1_probs)) if top1_probs else None,
+        "mean_margin": float(np.mean(margins)) if margins else None,
+        "logit_confidence": float(np.mean(top1_probs)) if top1_probs else None,
+        "response_length": len(response_text),
+    }
+
+# ============================================================
+# STEP 6: Loading & Freeing Models
+# ============================================================
+def load_model(config: ModelConfig, device):
+    print(f"[load] {config.name} on {device}...")
+    hf_token = os.environ.get("HF_TOKEN", None)
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        config.hf_id,
+        token=hf_token,
+        trust_remote_code=False
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    if config.use_4bit:
+        bnb = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_use_double_quant=True,
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            config.hf_id,
+            quantization_config=bnb,
+            device_map={"": device},
+            token=hf_token,
+            low_cpu_mem_usage=True,
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            config.hf_id,
+            torch_dtype=torch.float16,
+            token=hf_token,
+            low_cpu_mem_usage=True,
+        ).to(device)
+
+    model.eval()
+    dev_idx = int(str(device).split(":")[-1])
+    vram = torch.cuda.memory_allocated(dev_idx) / 1e9
+    print(f"[load] {config.name} ready on GPU {dev_idx}. VRAM: {vram:.2f} GB")
+    return model, tokenizer
+
+def free_model(model, tokenizer):
+    del model, tokenizer
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
+# ============================================================
+# STEP 7: Worker Execution
+# ============================================================
+def run_worker(gpu_id, model_names, all_datasets):
+    device = f"cuda:{gpu_id}"
+    torch.cuda.set_device(gpu_id)
+
+    print(f"\n[GPU {gpu_id}] Worker online. Assigned: {model_names}")
+    worker_e1e3 = []
+    worker_traces = []
+    worker_e4 = []
+
+    for config in ALL_GATED_MODELS:
+        if config.name not in model_names:
+            continue
+
+        done_flag = CHECKPOINT_DIR / f"{config.name}_DONE.flag"
+        if done_flag.exists():
+            print(f"[GPU {gpu_id}] {config.name} already done — skipping")
+            continue
+
+        print(f"\n[GPU {gpu_id}] ====== {config.name} ({config.size_b}B) ======")
+        try:
+            model, tokenizer = load_model(config, device)
+        except Exception as e:
+            print(f"[GPU {gpu_id}] ✗ Load failed for {config.name}: {e}")
+            traceback.print_exc()
+            continue
+
+        # 1. Run E1 + E3 (Direct + CoT)
+        print(f"[GPU {gpu_id}] Starting E1/E3 diagnostics...")
+        for ds_name, samples in all_datasets.items():
+            for mode in ["direct", "cot"]:
+                print(f"  {ds_name}/{mode}: ", end="", flush=True)
+                for i, s in enumerate(samples):
+                    if i % 50 == 0 and i > 0:
+                        print(f"{i} ", end="", flush=True)
+                    msgs = make_prompt_messages(s["question"], mode, ds_name, s.get("choices"))
+                    try:
+                        diag = generate_full_diagnostics(model, tokenizer, msgs, device)
+                        pred = parse_answer(diag["text"], ds_name)
+                        verb_conf = parse_confidence(diag["text"])
+                        correct = check_answer(pred, s["answer"])
+
+                        worker_e1e3.append({
+                            "model": config.name, "size_b": config.size_b,
+                            "dataset": ds_name, "mode": mode, "id": s["id"],
+                            "question_idx": i, "answer": s["answer"],
+                            "predicted": pred, "correct": correct,
+                            "verbalized_confidence": verb_conf,
+                            "logit_confidence": diag["logit_confidence"],
+                            "mean_entropy": diag["mean_entropy"],
+                            "first_token_entropy": diag["first_token_entropy"],
+                            "mean_top1_prob": diag["mean_top1_prob"],
+                            "mean_margin": diag["mean_margin"],
+                            "response_length": diag["response_length"],
+                        })
+
+                        if i < 50:  # Save first 50 traces per condition for E3 visualization
+                            worker_traces.append({
+                                "model": config.name, "size_b": config.size_b,
+                                "dataset": ds_name, "mode": mode, "sample_id": s["id"],
+                                "correct": correct, "entropies": diag["entropies"],
+                            })
+                    except Exception as e:
+                        pass
+                print("✓")
+
+        # 2. Run E4 (Filler-CoT)
+        print(f"[GPU {gpu_id}] Starting E4 Filler-CoT...")
+        for ds_name, samples in all_datasets.items():
+            print(f"  {ds_name}/filler: ", end="", flush=True)
+            for i, s in enumerate(samples):
+                if i % 50 == 0 and i > 0:
+                    print(f"{i} ", end="", flush=True)
+                msgs = make_prompt_messages(s["question"], "filler", ds_name, s.get("choices"))
+                try:
+                    diag = generate_full_diagnostics(model, tokenizer, msgs, device)
+                    pred = parse_answer(diag["text"], ds_name)
+                    verb_conf = parse_confidence(diag["text"])
+                    correct = check_answer(pred, s["answer"])
+
+                    worker_e4.append({
+                        "model": config.name, "size_b": config.size_b,
+                        "dataset": ds_name, "mode": "filler", "id": s["id"],
+                        "question_idx": i, "answer": s["answer"],
+                        "predicted": pred, "correct": correct,
+                        "verbalized_confidence": verb_conf,
+                        "logit_confidence": diag["logit_confidence"],
+                        "mean_entropy": diag["mean_entropy"],
+                        "first_token_entropy": diag["first_token_entropy"],
+                        "mean_top1_prob": diag["mean_top1_prob"],
+                        "mean_margin": diag["mean_margin"],
+                        "response_length": diag["response_length"],
+                    })
+                except Exception as e:
+                    pass
+            print("✓")
+
+        free_model(model, tokenizer)
+        done_flag.touch()
+        print(f"[GPU {gpu_id}] ✓ {config.name} finished.")
+
+    # Save worker parts
+    if worker_e1e3:
+        pd.DataFrame(worker_e1e3).to_csv(RESULTS_DIR / f"e1e3_gpu{gpu_id}.csv", index=False)
+    if worker_e4:
+        pd.DataFrame(worker_e4).to_csv(RESULTS_DIR / f"e4_gpu{gpu_id}.csv", index=False)
+    if worker_traces:
+        with open(RESULTS_DIR / f"traces_gpu{gpu_id}.json", "w") as f:
+            json.dump(worker_traces, f)
+
+    print(f"[GPU {gpu_id}] Worker complete.")
+
+# ============================================================
+# STEP 8: Main Launcher & Merging
+# ============================================================
+def main():
+    n_gpus = torch.cuda.device_count()
+    print(f"\n=======================================================")
+    print(f"GATED MODELS RUN (E1 + E3 + E4) — Detected {n_gpus} GPUs")
+    print(f"=======================================================")
+
+    print("\nLoading datasets...")
+    all_datasets = load_all_datasets()
+
+    if n_gpus >= 2:
+        print("\nSpawning 2 GPU worker processes...")
+        print(f"  GPU 0: {GPU0_MODELS}")
+        print(f"  GPU 1: {GPU1_MODELS}")
+
+        ctx = mp.get_context("spawn")
+        p0 = ctx.Process(target=run_worker, args=(0, GPU0_MODELS, all_datasets))
+        p1 = ctx.Process(target=run_worker, args=(1, GPU1_MODELS, all_datasets))
+
+        p0.start()
+        p1.start()
+
+        p0.join()
+        p1.join()
+        print("\nBoth GPU workers completed.")
+    else:
+        print("\nRunning all gated models sequentially on GPU 0...")
+        run_worker(0, [m.name for m in ALL_GATED_MODELS], all_datasets)
+
+    # Merge
+    print("\nMerging results...")
+    e1e3_files = list(RESULTS_DIR.glob("e1e3_gpu*.csv"))
+    e4_files = list(RESULTS_DIR.glob("e4_gpu*.csv"))
+    trace_files = list(RESULTS_DIR.glob("traces_gpu*.json"))
+
+    if e1e3_files:
+        combined_e1e3 = pd.concat([pd.read_csv(f) for f in e1e3_files], ignore_index=True)
+        combined_e1e3.to_csv(RESULTS_DIR / "e1_e3_logit_calibration_gated.csv", index=False)
+        print(f"Saved: e1_e3_logit_calibration_gated.csv ({len(combined_e1e3)} rows)")
+
+    if e4_files:
+        combined_e4 = pd.concat([pd.read_csv(f) for f in e4_files], ignore_index=True)
+        combined_e4.to_csv(RESULTS_DIR / "e4_filler_cot_gated.csv", index=False)
+        print(f"Saved: e4_filler_cot_gated.csv ({len(combined_e4)} rows)")
+
+    if trace_files:
+        all_traces = []
+        for tf in trace_files:
+            with open(tf) as f:
+                all_traces.extend(json.load(f))
+        with open(RESULTS_DIR / "e3_entropy_traces_gated.json", "w") as f:
+            json.dump(all_traces, f)
+        print(f"Saved: e3_entropy_traces_gated.json ({len(all_traces)} traces)")
+
+    print(f"\nALL COMPLETED! Files stored in: {RESULTS_DIR}")
+
+if __name__ == "__main__":
+    main()

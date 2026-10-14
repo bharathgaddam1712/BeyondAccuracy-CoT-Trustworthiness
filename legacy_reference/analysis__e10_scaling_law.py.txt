@@ -1,0 +1,279 @@
+"""
+E10 — Scaling Law Fit for Trust Metrics
+Phase 1: CPU-only, fits power-law and log-linear curves to existing metric deltas
+
+Tests whether ECE_delta and consistency_delta scale with different exponents
+as a function of model size N:
+    delta(N) = a * N^b + c
+
+If exponents b differ for ECE vs consistency, you've mathematically
+characterized the decoupled pattern and can predict crossover points.
+
+Run: python e10_scaling_law.py
+"""
+
+import numpy as np
+import pandas as pd
+from pathlib import Path
+
+RESULTS = Path("results")
+
+MODEL_SIZES = {
+    "Qwen2.5-0.5B": 0.5, "Llama-3.2-1B": 1.0, "Qwen2.5-1.5B": 1.5,
+    "Gemma-2-2B": 2.0, "Qwen2.5-3B": 3.0, "Llama-3.2-3B": 3.0,
+    "Llama-3.1-8B": 8.0,
+}
+
+
+def power_law(N, a, b, c):
+    """delta = a * N^b + c"""
+    return a * np.power(N, b) + c
+
+
+def try_power_law_fit(sizes, values, label, p0=None):
+    """Attempt power-law fit with fallback."""
+    try:
+        from scipy.optimize import curve_fit
+        if p0 is None:
+            p0 = [0.1, -0.5, 0]
+        popt, pcov = curve_fit(power_law, sizes, values, p0=p0, maxfev=10000)
+        perr = np.sqrt(np.diag(pcov))
+
+        # R² calculation
+        residuals = values - power_law(sizes, *popt)
+        ss_res = np.sum(residuals ** 2)
+        ss_tot = np.sum((values - np.mean(values)) ** 2)
+        r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+
+        print(f"  {label}: a={popt[0]:+.4f} (±{perr[0]:.4f}), b={popt[1]:+.4f} (±{perr[1]:.4f}), c={popt[2]:+.4f}")
+        print(f"    R² = {r_squared:.4f}")
+        return popt, r_squared
+    except Exception as e:
+        print(f"  {label}: Power-law fit failed — {e}")
+        return None, None
+
+
+def try_log_linear_fit(sizes, values, label):
+    """Log-linear fit: delta = a * ln(N) + b"""
+    try:
+        from scipy.stats import pearsonr
+        log_sizes = np.log(sizes)
+        coeffs = np.polyfit(log_sizes, values, 1)
+        r, p_val = pearsonr(log_sizes, values)
+
+        # R² for linear fit
+        predicted = np.polyval(coeffs, log_sizes)
+        ss_res = np.sum((values - predicted) ** 2)
+        ss_tot = np.sum((values - np.mean(values)) ** 2)
+        r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+
+        print(f"  {label}: slope={coeffs[0]:+.4f}, intercept={coeffs[1]:+.4f}")
+        print(f"    R = {r:.4f}, p = {p_val:.4f}, R² = {r_squared:.4f}")
+        return coeffs, r_squared
+    except Exception as e:
+        print(f"  {label}: Log-linear fit failed — {e}")
+        return None, None
+
+
+def load_ece_deltas():
+    """Load ECE deltas from calibration_ece.csv."""
+    csv_path = RESULTS / "calibration_ece.csv"
+    if not csv_path.exists():
+        return None
+
+    df = pd.read_csv(csv_path)
+    # Compute per-model average ECE delta across datasets
+    deltas = {}
+    for model in df["model"].unique():
+        direct = df[(df["model"] == model) & (df["mode"] == "direct")]
+        cot = df[(df["model"] == model) & (df["mode"] == "cot")]
+        if direct.empty or cot.empty:
+            continue
+        # Average ECE across datasets for each mode
+        ece_direct = direct["ece"].mean()
+        ece_cot = cot["ece"].mean()
+        deltas[model] = ece_cot - ece_direct  # negative = CoT helps
+    return deltas
+
+
+def load_consistency_deltas():
+    """Load consistency deltas from consistency_delta.csv."""
+    csv_path = RESULTS / "consistency_delta.csv"
+    if not csv_path.exists():
+        # Try computing from consistency_summary.csv
+        sum_path = RESULTS / "consistency_summary.csv"
+        if not sum_path.exists():
+            return None
+        df = pd.read_csv(sum_path)
+        deltas = {}
+        for model in df["model"].unique():
+            direct = df[(df["model"] == model) & (df["mode"] == "direct")]
+            cot = df[(df["model"] == model) & (df["mode"] == "cot")]
+            if direct.empty or cot.empty:
+                continue
+            deltas[model] = cot["consistency"].mean() - direct["consistency"].mean()
+        return deltas
+
+    df = pd.read_csv(csv_path)
+    # Average delta across datasets per model
+    deltas = {}
+    for model in df["model"].unique():
+        deltas[model] = df[df["model"] == model]["delta"].mean()
+    return deltas
+
+
+def load_accuracy_deltas():
+    """Load accuracy deltas from accuracy_summary.csv."""
+    csv_path = RESULTS / "accuracy_summary.csv"
+    if not csv_path.exists():
+        return None
+
+    df = pd.read_csv(csv_path)
+    deltas = {}
+    for model in df["model"].unique():
+        direct = df[(df["model"] == model) & (df["mode"] == "direct")]
+        cot = df[(df["model"] == model) & (df["mode"] == "cot")]
+        if direct.empty or cot.empty:
+            continue
+        deltas[model] = cot["accuracy"].mean() - direct["accuracy"].mean()
+    return deltas
+
+
+def main():
+    print("=" * 70)
+    print("E10 — SCALING LAW FIT FOR TRUST METRICS")
+    print("=" * 70)
+
+    # --- Load all deltas ---
+    ece_deltas = load_ece_deltas()
+    con_deltas = load_consistency_deltas()
+    acc_deltas = load_accuracy_deltas()
+
+    available = []
+    if ece_deltas:
+        available.append(("ECE Δ (CoT−Direct)", ece_deltas, [-0.1, -0.5, 0]))
+        print(f"\nLoaded ECE deltas for {len(ece_deltas)} models")
+    else:
+        print("\n⚠ No calibration data found — skipping ECE scaling law")
+
+    if con_deltas:
+        available.append(("Consistency Δ (CoT−Direct)", con_deltas, [0.01, 0.5, 0]))
+        print(f"Loaded consistency deltas for {len(con_deltas)} models")
+    else:
+        print("⚠ No consistency data found — skipping consistency scaling law")
+
+    if acc_deltas:
+        available.append(("Accuracy Δ (CoT−Direct)", acc_deltas, [0.01, 0.5, 0]))
+        print(f"Loaded accuracy deltas for {len(acc_deltas)} models")
+    else:
+        print("⚠ No accuracy data found — skipping accuracy scaling law")
+
+    if not available:
+        print("\nNo result CSVs found in results/. Run the main pipeline first.")
+        print(f"Expected files: calibration_ece.csv, consistency_delta.csv, accuracy_summary.csv")
+        return
+
+    # --- Print raw data ---
+    print("\n" + "-" * 70)
+    print("RAW METRIC DELTAS (negative ECE Δ = CoT helps calibration)")
+    print("-" * 70)
+
+    all_models = set()
+    for _, deltas, _ in available:
+        all_models.update(deltas.keys())
+    all_models = sorted(all_models, key=lambda m: MODEL_SIZES.get(m, 99))
+
+    header = f"{'Model':20s} | {'Size':>5s}"
+    for label, _, _ in available:
+        short = label.split(" Δ")[0]
+        header += f" | {short:>12s}"
+    print(header)
+    print("-" * len(header))
+
+    for model in all_models:
+        size = MODEL_SIZES.get(model, "?")
+        row = f"{model:20s} | {size:5.1f}"
+        for _, deltas, _ in available:
+            val = deltas.get(model)
+            row += f" | {val:+12.4f}" if val is not None else f" | {'N/A':>12s}"
+        print(row)
+
+    # --- Fit scaling laws ---
+    results = {}
+    for label, deltas, p0 in available:
+        models = sorted(deltas.keys(), key=lambda m: MODEL_SIZES.get(m, 99))
+        sizes = np.array([MODEL_SIZES[m] for m in models if m in MODEL_SIZES])
+        values = np.array([deltas[m] for m in models if m in MODEL_SIZES])
+
+        if len(sizes) < 3:
+            print(f"\n⚠ {label}: Only {len(sizes)} data points — need at least 3 for fitting")
+            continue
+
+        print(f"\n{'=' * 70}")
+        print(f"FITTING: {label}  (n={len(sizes)} models)")
+        print(f"{'=' * 70}")
+
+        print("\n  Power-law: Δ(N) = a · N^b + c")
+        popt, r2_pow = try_power_law_fit(sizes, values, label, p0)
+
+        print("\n  Log-linear: Δ(N) = a · ln(N) + b")
+        coeffs, r2_log = try_log_linear_fit(sizes, values, label)
+
+        results[label] = {
+            "power_law": {"params": popt, "r2": r2_pow},
+            "log_linear": {"params": coeffs, "r2": r2_log},
+        }
+
+    # --- Compare exponents ---
+    if len(results) >= 2:
+        print("\n" + "=" * 70)
+        print("EXPONENT COMPARISON")
+        print("=" * 70)
+
+        for label, res in results.items():
+            if res["power_law"]["params"] is not None:
+                b = res["power_law"]["params"][1]
+                print(f"  {label}: b = {b:+.4f}")
+
+        labels = list(results.keys())
+        if (results.get(labels[0], {}).get("power_law", {}).get("params") is not None and
+            len(labels) > 1 and
+            results.get(labels[1], {}).get("power_law", {}).get("params") is not None):
+
+            b1 = results[labels[0]]["power_law"]["params"][1]
+            b2 = results[labels[1]]["power_law"]["params"][1]
+            print(f"\n  Exponent difference: {abs(b1 - b2):.4f}")
+            if abs(b1 - b2) > 0.3:
+                print("  → Exponents DIFFER meaningfully — trust metrics scale differently!")
+                print("  → This supports the 'decoupled scaling' finding")
+            else:
+                print("  → Exponents are similar — scaling may not be as decoupled as hypothesized")
+
+    print(f"\n⚠ Note: With only {len(MODEL_SIZES)} models, all fits are noisy.")
+    print("  After E7 (adding more model families), re-run with 11+ models for robust curves.")
+    print("  The log-linear fit is more reliable with few data points.")
+
+    # --- Save fit results ---
+    fit_rows = []
+    for label, res in results.items():
+        row = {"metric": label}
+        if res["power_law"]["params"] is not None:
+            row["pow_a"] = res["power_law"]["params"][0]
+            row["pow_b"] = res["power_law"]["params"][1]
+            row["pow_c"] = res["power_law"]["params"][2]
+            row["pow_r2"] = res["power_law"]["r2"]
+        if res["log_linear"]["params"] is not None:
+            row["log_slope"] = res["log_linear"]["params"][0]
+            row["log_intercept"] = res["log_linear"]["params"][1]
+            row["log_r2"] = res["log_linear"]["r2"]
+        fit_rows.append(row)
+
+    if fit_rows:
+        fit_df = pd.DataFrame(fit_rows)
+        fit_path = RESULTS / "e10_scaling_law_fits.csv"
+        fit_df.to_csv(fit_path, index=False)
+        print(f"\nSaved: {fit_path}")
+
+
+if __name__ == "__main__":
+    main()

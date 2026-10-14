@@ -1,0 +1,197 @@
+"""
+consistency_audit.py — Steps 1, 3, 4, 5 from reviewer feedback
+===============================================================
+Step 1: Resolve the 5x contradiction (91% vs 17.5%) by reconstructing
+        the metric from raw data for Qwen2.5-0.5B.
+Step 3: Bootstrap significance tests on all CoT-Direct and Filler-Direct
+        consistency deltas.
+Step 4: Re-examine regimes indexed by accuracy (capability), not raw size.
+Step 5: Parsing audit — sample 20 raw filler responses to check parse rate.
+"""
+
+import json
+import re
+import random
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from collections import Counter
+
+RESULTS = Path("results")
+DATA    = Path("data")
+np.random.seed(42)
+
+# ============================================================
+# STEP 1: RECONSTRUCT THE METRIC — what does each CSV actually measure?
+# ============================================================
+print("=" * 90)
+print("STEP 1: METRIC RECONSTRUCTION — WHAT DOES EACH NUMBER ACTUALLY MEASURE?")
+print("=" * 90)
+
+# Load both sources
+overnight_df = pd.read_csv(RESULTS / "overnight_consistency_final.csv")
+raw_df       = pd.read_csv(RESULTS / "e4_consistency_cross_scale_raw.csv")
+
+print(f"\nOvernight CSV columns : {list(overnight_df.columns)}")
+print(f"Raw cross-scale rows  : {len(raw_df)}")
+
+# Check the raw data for Qwen2.5-0.5B direct mode
+q05_direct = raw_df[(raw_df["model"] == "Qwen2.5-0.5B") & (raw_df["mode"] == "direct")]
+print(f"\nQwen2.5-0.5B / direct — rows in raw CSV: {len(q05_direct)}")
+print(f"Questions covered: {q05_direct['question_id'].nunique()}")
+print(f"Variants per question distribution:\n{q05_direct.groupby('question_id').size().value_counts().to_string()}")
+
+# Show actual predicted values for first 5 questions
+print("\n--- First 5 questions: predicted answers ---")
+for qid, grp in list(q05_direct.groupby("question_id"))[:5]:
+    preds = grp["predicted"].tolist()
+    c = Counter(preds)
+    # Our pairwise metric
+    n = len(preds)
+    total_pairs = n * (n - 1) / 2
+    agree = sum(1 for i in range(n) for j in range(i+1, n)
+                if preds[i] == preds[j] and preds[i] and preds[j])
+    pairwise = agree / total_pairs if total_pairs > 0 else 0.0
+    # Plurality metric (fraction matching mode)
+    top = c.most_common(1)[0][1]
+    plurality = top / n
+    # Empty parse rate
+    empty_rate = sum(1 for p in preds if not p) / n
+    print(f"  {qid}: answers={preds}, pairwise={pairwise:.3f}, "
+          f"plurality={plurality:.3f}, empty_rate={empty_rate:.0%}")
+
+# Now check the old consistency_summary.csv to understand its metric
+old_csv = RESULTS / "consistency_summary.csv"
+if old_csv.exists():
+    old_df = pd.read_csv(old_csv)
+    print(f"\nOld consistency_summary.csv columns: {list(old_df.columns)}")
+    q05_old = old_df[old_df["model"] == "Qwen2.5-0.5B"]
+    print(f"Qwen2.5-0.5B old values:\n{q05_old.to_string(index=False)}")
+else:
+    print("\nNo old consistency_summary.csv found — the 91% came from in-memory load in e4_consistency_eval.py")
+
+# ============================================================
+# STEP 5: PARSING AUDIT — FILLER RESPONSE PARSE RATE
+# ============================================================
+print("\n" + "=" * 90)
+print("STEP 5: PARSING AUDIT — FILLER RESPONSE PARSE RATES PER MODEL")
+print("=" * 90)
+
+def parse_answer(text: str) -> str:
+    m = re.findall(r'Answer:\s*([+-]?\d[\d,\.]*|[A-Z])', text, re.IGNORECASE)
+    if m:
+        return m[-1].replace(',', '').strip().lower()
+    return ""
+
+# The raw responses are not stored in our CSV — check empty rate from raw preds
+for mode in ["direct", "cot", "filler"]:
+    mode_df = raw_df[raw_df["mode"] == mode] if "mode" in raw_df.columns else pd.DataFrame()
+    if mode_df.empty:
+        continue
+    total = len(mode_df)
+    empty = (mode_df["predicted"] == "").sum()
+    print(f"  {mode:8s} | Total rows: {total:4d} | Empty parses: {empty:4d} ({empty/total*100:.1f}%)")
+    by_model = mode_df.groupby("model").apply(lambda g: (g["predicted"] == "").sum() / len(g))
+    for m_name, rate in by_model.items():
+        print(f"           -> {m_name:15s}: {rate*100:.1f}% empty")
+
+# ============================================================
+# STEP 3: BOOTSTRAP SIGNIFICANCE TESTS ON CONSISTENCY DELTAS
+# ============================================================
+print("\n" + "=" * 90)
+print("STEP 3: BOOTSTRAP SIGNIFICANCE TESTS (N=5000) ON CONSISTENCY DELTAS")
+print("=" * 90)
+
+def bootstrap_delta_pvalue(group_a, group_b, n_boot=5000):
+    """Two-sided test: Is mean(A) - mean(B) significantly different from 0?"""
+    observed_delta = np.mean(group_a) - np.mean(group_b)
+    pooled = np.concatenate([group_a, group_b])
+    n_a = len(group_a)
+    boot_deltas = np.array([
+        np.mean(np.random.choice(pooled, n_a, replace=True)) -
+        np.mean(np.random.choice(pooled, len(group_b), replace=True))
+        for _ in range(n_boot)
+    ])
+    p = np.mean(np.abs(boot_deltas) >= np.abs(observed_delta))
+    ci_lo, ci_hi = np.percentile(boot_deltas, [2.5, 97.5])
+    return observed_delta, ci_lo, ci_hi, p
+
+# Compute per-question consistency for each model/mode from raw data
+print(f"\n{'Model':15s} | {'Mode Pair':20s} | {'Delta':>8s} | {'95% CI':>20s} | {'p-value':>8s} | {'Significant?':>12s}")
+print("-" * 90)
+
+for model_name, grp in raw_df.groupby("model"):
+    for mode_a, mode_b in [("cot", "direct"), ("filler", "direct")]:
+        a_df = grp[grp["mode"] == mode_a] if "mode" in grp.columns else pd.DataFrame()
+        b_df = grp[grp["mode"] == mode_b] if "mode" in grp.columns else pd.DataFrame()
+        if a_df.empty or b_df.empty:
+            continue
+
+        # Per-question pairwise consistency
+        def per_q_consistency(df):
+            vals = []
+            for qid, g in df.groupby("question_id"):
+                preds = g["predicted"].tolist()
+                n = len(preds)
+                if n < 2:
+                    continue
+                tp = n * (n - 1) / 2
+                ag = sum(1 for i in range(n) for j in range(i+1, n)
+                         if preds[i] == preds[j] and preds[i] and preds[j])
+                vals.append(ag / tp)
+            return np.array(vals)
+
+        a_vals = per_q_consistency(a_df)
+        b_vals = per_q_consistency(b_df)
+
+        if len(a_vals) < 5 or len(b_vals) < 5:
+            continue
+
+        delta, ci_lo, ci_hi, p = bootstrap_delta_pvalue(a_vals, b_vals)
+        sig = "YES *" if p < 0.05 else ("marginal" if p < 0.10 else "no")
+        pair_str = f"{mode_a} - {mode_b}"
+        print(f"{model_name:15s} | {pair_str:20s} | {delta:+8.4f} | [{ci_lo:+7.4f}, {ci_hi:+7.4f}] | {p:8.4f} | {sig:>12s}")
+
+# ============================================================
+# STEP 4: REGIME REFRAME — ACCURACY (CAPABILITY), NOT SIZE
+# ============================================================
+print("\n" + "=" * 90)
+print("STEP 4: REGIME REFRAME — CAPABILITY (ACCURACY) vs CONSISTENCY DELTA")
+print("=" * 90)
+
+# Load accuracy data
+calib_df = pd.read_csv(RESULTS / "master_e1_e3_logit_calibration.csv")
+acc_by_model = calib_df.groupby(["model", "mode"])["correct"].mean().reset_index()
+cot_acc = acc_by_model[acc_by_model["mode"] == "cot"].set_index("model")["correct"]
+
+# CoT-Direct consistency delta from overnight run
+overnight_df = overnight_df.set_index("Model")
+overnight_df["cot_accuracy"] = overnight_df.index.map(cot_acc)
+
+print(f"\n{'Model':15s} | {'CoT Accuracy':>13s} | {'CoT-Direct Consist':>20s} | {'Fill-Direct Consist':>21s} | {'Capability Regime':>20s}")
+print("-" * 95)
+
+sorted_by_acc = overnight_df.dropna(subset=["cot_accuracy"]).sort_values("cot_accuracy")
+for model_name, r in sorted_by_acc.iterrows():
+    acc = r["cot_accuracy"]
+    cot_d = r["CoT - Direct"]
+    fill_d = r["Filler - Direct"]
+    if acc < 0.25:
+        cap_regime = "Low Capability"
+    elif acc < 0.40:
+        cap_regime = "Mid Capability"
+    else:
+        cap_regime = "High Capability"
+    print(f"{model_name:15s} | {acc*100:12.1f}% | {cot_d*100:+19.1f}% | {fill_d*100:+20.1f}% | {cap_regime:>20s}")
+
+print("\nKey question: Does capability (CoT accuracy) predict consistency delta better than raw size?")
+from scipy.stats import pearsonr
+valid = sorted_by_acc.dropna(subset=["cot_accuracy", "CoT - Direct"])
+r_acc, p_acc = pearsonr(valid["cot_accuracy"], valid["CoT - Direct"])
+r_fill, p_fill = pearsonr(valid["cot_accuracy"], valid["Filler - Direct"])
+print(f"  Corr(CoT Accuracy, CoT-Direct Consist Delta)    : r={r_acc:+.3f}, p={p_acc:.4f}")
+print(f"  Corr(CoT Accuracy, Filler-Direct Consist Delta) : r={r_fill:+.3f}, p={p_fill:.4f}")
+
+print("\n" + "=" * 90)
+print("AUDIT COMPLETE")
+print("=" * 90)

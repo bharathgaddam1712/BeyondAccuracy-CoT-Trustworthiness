@@ -1,0 +1,219 @@
+"""
+kaggle_consistency_pipeline.py — E7/E8 Multi-Model Consistency Benchmark
+======================================================================
+This script evaluates Paraphrase Consistency across the 11-model scaling
+run (focusing on SmolLM2 and Phi-3 families) to formally confirm that
+the Decoupled Pattern (Calibration vs Consistency) holds across architectures.
+
+Optimized for Kaggle Dual T4 GPUs (2x 16GB VRAM) using multiprocessing.
+
+Outputs:
+  - results/consistency_summary_e7_e8.csv
+  - results/consistency_raw_e7_e8.csv
+"""
+
+import os
+import gc
+import json
+import re
+import numpy as np
+import pandas as pd
+import torch
+import multiprocessing as mp
+from pathlib import Path
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+# --- CONFIGURATION ---
+RESULTS = Path("results")
+DATA = Path("data")
+RESULTS.mkdir(exist_ok=True, parents=True)
+
+# The 4 expansion models from E7/E8
+MODELS = [
+    "HuggingFaceTB/SmolLM2-360M-Instruct",
+    "HuggingFaceTB/SmolLM2-1.7B-Instruct",
+    "microsoft/Phi-3-mini-4k-instruct",
+    "microsoft/Phi-3.5-mini-instruct"
+]
+
+MODES = ["direct", "cot"]
+LIMIT_QUESTIONS = 50  # Limit for Kaggle runtime
+
+# --- SYSTEM PROMPTS ---
+SYSTEM_PROMPTS = {
+    "direct": "You are a helpful math assistant. Provide the final answer directly with no explanation. End with 'Answer: <your answer>'.",
+    "cot": "You are a helpful math assistant. Think step-by-step to solve the problem. End with 'Answer: <your answer>'."
+}
+
+def parse_answer(text):
+    """Fallback parser for consistency matching."""
+    m = re.findall(r'Answer:\s*([+-]?\d[\d,\.]*|[A-D])', text, re.IGNORECASE)
+    if m:
+        return m[-1].replace(',', '').strip().lower()
+    all_tokens = text.strip().split()
+    return all_tokens[-1].lower() if all_tokens else ""
+
+def worker_process(gpu_id, model_queue, result_queue, para_dict):
+    """Worker process that loads a model onto a specific GPU and evaluates it."""
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    device = "cuda:0"  # Each process sees its assigned GPU as cuda:0
+
+    while not model_queue.empty():
+        try:
+            model_id = model_queue.get_nowait()
+        except:
+            break
+
+        short_name = model_id.split("/")[-1]
+        print(f"[GPU {gpu_id}] Loading {short_name}...")
+
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=False)
+            model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                torch_dtype=torch.float16,
+                trust_remote_code=False,
+                attn_implementation="eager" if "Phi" in model_id else None
+            ).to(device)
+            model.eval()
+            print(f"[GPU {gpu_id}] Loaded {short_name} successfully.")
+
+            # Filter paraphrases
+            valid_items = {k: v for k, v in para_dict.items() if len(v) >= 4 and "gsm8k" in k}
+            selected_keys = list(valid_items.keys())[:LIMIT_QUESTIONS]
+
+            for mode in MODES:
+                sys_prompt = SYSTEM_PROMPTS[mode]
+                print(f"[GPU {gpu_id}] Running {short_name} in {mode} mode...")
+
+                results = []
+                for q_idx, q_key in enumerate(selected_keys):
+                    variants = valid_items[q_key][:5]  # Original + 4 variants
+                    
+                    for p_idx, text in enumerate(variants):
+                        messages = [
+                            {"role": "system", "content": sys_prompt},
+                            {"role": "user", "content": f"Question: {text}\nAnswer:"}
+                        ]
+                        
+                        prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024).to(device)
+                        input_len = inputs["input_ids"].shape[1]
+
+                        with torch.no_grad():
+                            out = model.generate(
+                                **inputs, 
+                                max_new_tokens=64 if mode=="direct" else 384, 
+                                do_sample=False, 
+                                pad_token_id=tokenizer.eos_token_id
+                            )
+                        
+                        resp = tokenizer.decode(out[0][input_len:], skip_special_tokens=True).strip()
+                        pred = parse_answer(resp)
+                        
+                        results.append({
+                            "model": short_name,
+                            "mode": mode,
+                            "question_id": q_key,
+                            "variant_idx": p_idx,
+                            "predicted": pred,
+                            "response": resp[:100] # truncated for logging
+                        })
+
+                # Compute consistency for this mode
+                res_df = pd.DataFrame(results)
+                agreements = []
+                for q_id, grp in res_df.groupby("question_id"):
+                    preds = grp["predicted"].tolist()
+                    if len(preds) > 1:
+                        agree_count = sum(1 for i in range(len(preds)) for j in range(i+1, len(preds)) if preds[i] == preds[j] and len(preds[i]) > 0)
+                        total_pairs = len(preds) * (len(preds) - 1) / 2
+                        agreements.append(agree_count / total_pairs if total_pairs > 0 else 0.0)
+
+                consist_val = float(np.mean(agreements))
+                result_queue.put({
+                    "model": short_name,
+                    "mode": mode,
+                    "consistency": consist_val,
+                    "raw_data": results
+                })
+
+            del model
+            del tokenizer
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        except Exception as e:
+            print(f"[GPU {gpu_id}] FAILED on {model_id}: {str(e)}")
+
+def main():
+    print("=" * 80)
+    print("KAGGLE PARAPHRASE CONSISTENCY PIPELINE (E7/E8 MODELS)")
+    print("=" * 80)
+
+    # 1. Load Paraphrases
+    para_path = DATA / "paraphrases.json"
+    if not para_path.exists():
+        print(f"ERROR: Could not find {para_path}. Ensure it is uploaded to Kaggle.")
+        return
+
+    with open(para_path, "r") as f:
+        para_dict = json.load(f)
+
+    # 2. Setup Multiprocessing
+    mp.set_start_method("spawn", force=True)
+    manager = mp.Manager()
+    model_queue = manager.Queue()
+    result_queue = manager.Queue()
+
+    for m in MODELS:
+        model_queue.put(m)
+
+    num_gpus = torch.cuda.device_count()
+    if num_gpus == 0:
+        print("No GPUs found! Running on CPU (this will be extremely slow).")
+        num_gpus = 1
+
+    print(f"Found {num_gpus} GPUs. Launching worker processes...")
+
+    processes = []
+    for i in range(num_gpus):
+        p = mp.Process(target=worker_process, args=(i, model_queue, result_queue, para_dict))
+        p.start()
+        processes.append(p)
+
+    for p in processes:
+        p.join()
+
+    # 3. Aggregate Results
+    summary_rows = []
+    all_raw = []
+
+    while not result_queue.empty():
+        res = result_queue.get()
+        summary_rows.append({
+            "model": res["model"],
+            "mode": res["mode"],
+            "consistency": res["consistency"]
+        })
+        all_raw.extend(res["raw_data"])
+
+    if summary_rows:
+        summary_df = pd.DataFrame(summary_rows)
+        summary_df.to_csv(RESULTS / "consistency_summary_e7_e8.csv", index=False)
+        
+        raw_df = pd.DataFrame(all_raw)
+        raw_df.to_csv(RESULTS / "consistency_raw_e7_e8.csv", index=False)
+
+        print("\n" + "=" * 80)
+        print("CONSISTENCY EVALUATION COMPLETE")
+        print("=" * 80)
+        # Pivot for clean display
+        pivot = summary_df.pivot(index="model", columns="mode", values="consistency").reset_index()
+        print(pivot.to_string(index=False))
+        print("=" * 80)
+    else:
+        print("No results were generated. Check logs for errors.")
+
+if __name__ == "__main__":
+    main()

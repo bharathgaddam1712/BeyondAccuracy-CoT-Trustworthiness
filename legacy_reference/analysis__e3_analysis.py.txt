@@ -1,0 +1,269 @@
+"""
+E3 Analysis — Entropy Dynamics During CoT Generation
+Phase 3: Run after overnight_gpu_run.py completes.
+
+Visualizes per-token entropy trajectories to see if small models
+actually "compute" during CoT or just generate filler text.
+
+Key signal:
+  - If sub-3B entropy stays FLAT during CoT → decorative CoT (formatting template)
+  - If ≥3B entropy DROPS during CoT → genuine computation (uncertainty reduction)
+  This directly explains the decoupled pattern: formatting helps calibration
+  at all scales, but only real computation helps consistency.
+
+Run: python e3_analysis.py
+"""
+
+import json
+import numpy as np
+import pandas as pd
+from pathlib import Path
+
+RESULTS = Path("results")
+FIGURES = Path("figures")
+FIGURES.mkdir(exist_ok=True)
+
+MODEL_SIZES = {
+    "Qwen2.5-0.5B": 0.5, "Llama-3.2-1B": 1.0, "Qwen2.5-1.5B": 1.5,
+    "Gemma-2-2B": 2.0, "Qwen2.5-3B": 3.0, "Llama-3.2-3B": 3.0,
+    "Llama-3.1-8B": 8.0,
+}
+
+
+def main():
+    traces_path = RESULTS / "e3_entropy_traces.json"
+    if not traces_path.exists():
+        print(f"ERROR: {traces_path} not found. Run overnight_gpu_run.py first.")
+        return
+
+    with open(traces_path) as f:
+        traces = json.load(f)
+
+    print(f"Loaded {len(traces)} entropy traces")
+
+    # --- Get available models sorted by size ---
+    available_models = sorted(
+        set(t["model"] for t in traces),
+        key=lambda m: MODEL_SIZES.get(m, 99)
+    )
+    print(f"Models: {available_models}")
+    print(f"Modes: {sorted(set(t['mode'] for t in traces))}")
+    print(f"Datasets: {sorted(set(t['dataset'] for t in traces))}")
+
+    # ================================================================
+    # 1. Entropy trajectory visualization (per model × mode)
+    # ================================================================
+    try:
+        import matplotlib.pyplot as plt
+        import matplotlib.gridspec as gridspec
+
+        n_models = len(available_models)
+        fig, axes = plt.subplots(n_models, 2, figsize=(16, 3.5 * n_models), squeeze=False)
+
+        for row, model in enumerate(available_models):
+            for col, mode in enumerate(["direct", "cot"]):
+                ax = axes[row, col]
+
+                # Filter traces for this model/mode, prefer gsm8k for math reasoning
+                model_traces = [
+                    t for t in traces
+                    if t["model"] == model and t["mode"] == mode and t["dataset"] == "gsm8k"
+                ]
+                if not model_traces:
+                    # Fallback to any dataset
+                    model_traces = [
+                        t for t in traces
+                        if t["model"] == model and t["mode"] == mode
+                    ]
+
+                if not model_traces:
+                    ax.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax.transAxes)
+                    ax.set_title(f"{model} — {mode}", fontsize=10)
+                    continue
+
+                # Plot individual traces (faded)
+                for t in model_traces[:30]:
+                    ent = t["entropies"]
+                    if len(ent) < 2:
+                        continue
+                    x = np.linspace(0, 1, len(ent))
+                    ax.plot(x, ent, alpha=0.1, color="steelblue", linewidth=0.5)
+
+                # Compute and plot average trace (interpolated to common x-axis)
+                padded = []
+                for t in model_traces:
+                    e = t["entropies"]
+                    if len(e) < 2:
+                        continue
+                    interp = np.interp(np.linspace(0, 1, 100), np.linspace(0, 1, len(e)), e)
+                    padded.append(interp)
+
+                if padded:
+                    mean_trace = np.mean(padded, axis=0)
+                    std_trace = np.std(padded, axis=0)
+                    x100 = np.linspace(0, 1, 100)
+
+                    ax.plot(x100, mean_trace, color="darkred", linewidth=2.5, label="mean", zorder=10)
+                    ax.fill_between(x100, mean_trace - std_trace, mean_trace + std_trace,
+                                   color="darkred", alpha=0.15)
+
+                size = MODEL_SIZES.get(model, "?")
+                scale = "sub-3B" if isinstance(size, (int, float)) and size < 3 else "≥3B"
+                ax.set_title(f"{model} ({size}B, {scale}) — {mode}", fontsize=10)
+                ax.set_ylabel("Token Entropy (nats)")
+                if row == n_models - 1:
+                    ax.set_xlabel("Position in response (normalized)")
+                if row == 0 and col == 0:
+                    ax.legend(fontsize=8)
+
+        plt.suptitle("E3: Entropy Dynamics During Generation\n"
+                     "Flat = decorative/filler | Dropping = genuine computation",
+                     fontsize=13, fontweight="bold", y=1.01)
+        plt.tight_layout()
+
+        fig_path = FIGURES / "e3_entropy_trajectories.png"
+        plt.savefig(fig_path, dpi=150, bbox_inches="tight")
+        print(f"\nSaved figure: {fig_path}")
+        plt.close()
+
+    except ImportError:
+        print("\n(matplotlib not available — skipping trajectory plot)")
+
+    # ================================================================
+    # 2. Summary statistics table
+    # ================================================================
+    print("\n" + "=" * 80)
+    print("ENTROPY SUMMARY STATISTICS")
+    print("=" * 80 + "\n")
+
+    header = f"{'Model':20s} | {'Size':>5s} | {'Scale':>6s} | {'Mode':6s} | {'Mean Ent':>8s} | {'Ent Drop':>8s} | {'Ent Slope':>9s} | {'n':>4s}"
+    print(header)
+    print("-" * len(header))
+
+    summary_rows = []
+    for model in available_models:
+        for mode in ["direct", "cot"]:
+            mt = [t for t in traces if t["model"] == model and t["mode"] == mode]
+            if not mt:
+                continue
+
+            mean_ents = []
+            entropy_drops = []
+            entropy_slopes = []
+
+            for t in mt:
+                e = t["entropies"]
+                if len(e) < 4:
+                    continue
+                mean_ents.append(np.mean(e))
+
+                # Entropy drop: mean(first quarter) - mean(last quarter)
+                q = max(1, len(e) // 4)
+                drop = np.mean(e[:q]) - np.mean(e[-q:])
+                entropy_drops.append(drop)
+
+                # Linear slope: negative = entropy decreasing over response
+                x = np.arange(len(e))
+                slope = np.polyfit(x, e, 1)[0]
+                entropy_slopes.append(slope)
+
+            if not mean_ents:
+                continue
+
+            size = MODEL_SIZES.get(model, 0)
+            scale = "sub-3B" if size < 3 else "≥3B"
+
+            avg_ent = np.mean(mean_ents)
+            avg_drop = np.mean(entropy_drops) if entropy_drops else 0
+            avg_slope = np.mean(entropy_slopes) if entropy_slopes else 0
+
+            print(f"{model:20s} | {size:5.1f} | {scale:>6s} | {mode:6s} | "
+                  f"{avg_ent:8.3f} | {avg_drop:+8.3f} | {avg_slope:+9.5f} | {len(mt):4d}")
+
+            summary_rows.append({
+                "model": model, "size_b": size, "scale": scale, "mode": mode,
+                "mean_entropy": round(avg_ent, 4),
+                "entropy_drop": round(avg_drop, 4),
+                "entropy_slope": round(avg_slope, 6),
+                "n_traces": len(mt),
+            })
+
+    summary_df = pd.DataFrame(summary_rows)
+
+    # ================================================================
+    # 3. CoT vs Direct entropy comparison
+    # ================================================================
+    print("\n" + "=" * 80)
+    print("CoT vs DIRECT: Does CoT cause more entropy reduction?")
+    print("  Positive Ent Drop Δ = CoT has MORE entropy reduction than direct")
+    print("=" * 80 + "\n")
+
+    delta_rows = []
+    for model in available_models:
+        direct = summary_df[(summary_df["model"] == model) & (summary_df["mode"] == "direct")]
+        cot = summary_df[(summary_df["model"] == model) & (summary_df["mode"] == "cot")]
+        if direct.empty or cot.empty:
+            continue
+
+        d, c = direct.iloc[0], cot.iloc[0]
+        size = MODEL_SIZES.get(model, 0)
+        scale = "sub-3B" if size < 3 else "≥3B"
+
+        drop_delta = c["entropy_drop"] - d["entropy_drop"]
+        slope_delta = c["entropy_slope"] - d["entropy_slope"]
+
+        # Interpretation
+        if c["entropy_drop"] > 0.1 and c["entropy_slope"] < -0.001:
+            pattern = "✓ COMPUTING (entropy drops during CoT)"
+        elif abs(c["entropy_drop"]) < 0.05 and abs(c["entropy_slope"]) < 0.0005:
+            pattern = "✗ FLAT (decorative CoT)"
+        else:
+            pattern = "~ MIXED"
+
+        print(f"{model} ({size}B, {scale}):")
+        print(f"  CoT entropy drop: {c['entropy_drop']:+.4f} (direct: {d['entropy_drop']:+.4f}, Δ: {drop_delta:+.4f})")
+        print(f"  CoT entropy slope: {c['entropy_slope']:+.6f} (direct: {d['entropy_slope']:+.6f})")
+        print(f"  → {pattern}")
+        print()
+
+        delta_rows.append({
+            "model": model, "size_b": size, "scale": scale,
+            "cot_entropy_drop": c["entropy_drop"],
+            "direct_entropy_drop": d["entropy_drop"],
+            "drop_delta": round(drop_delta, 4),
+            "cot_slope": c["entropy_slope"],
+            "pattern": pattern,
+        })
+
+    # --- Save ---
+    summary_df.to_csv(RESULTS / "e3_entropy_summary.csv", index=False)
+    if delta_rows:
+        delta_df = pd.DataFrame(delta_rows)
+        delta_df.to_csv(RESULTS / "e3_entropy_deltas.csv", index=False)
+
+        # Scale group summary
+        print("=" * 80)
+        print("SUMMARY BY SCALE")
+        print("=" * 80)
+        for scale in ["sub-3B", "≥3B"]:
+            sg = delta_df[delta_df["scale"] == scale]
+            if sg.empty:
+                continue
+            computing = sum("COMPUTING" in p for p in sg["pattern"])
+            flat = sum("FLAT" in p for p in sg["pattern"])
+            print(f"\n  {scale}: {computing} computing, {flat} flat, {len(sg) - computing - flat} mixed")
+            print(f"    Avg CoT entropy drop: {sg['cot_entropy_drop'].mean():+.4f}")
+
+    print(f"\nSaved: {RESULTS / 'e3_entropy_summary.csv'}")
+    if delta_rows:
+        print(f"Saved: {RESULTS / 'e3_entropy_deltas.csv'}")
+
+    print("\n=== INTERPRETATION ===")
+    print("If sub-3B = FLAT and ≥3B = COMPUTING:")
+    print("  → Small model CoT is decorative (formatting template, not computation)")
+    print("  → Explains decoupled pattern: format helps calibration, but only")
+    print("    real computation helps consistency")
+
+
+if __name__ == "__main__":
+    main()

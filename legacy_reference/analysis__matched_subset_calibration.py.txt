@@ -1,0 +1,152 @@
+"""
+matched_subset_calibration.py
+==============================
+THE FORK-IN-THE-ROAD CHECK:
+Does filler's lower ECE survive when scored on the SAME QUESTIONS
+that all three modes (direct, filler, CoT) successfully parsed?
+
+If YES -> calibration finding is real.
+If NO  -> it was survivorship bias (filler only scored easy questions).
+"""
+
+import pandas as pd
+import numpy as np
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+RESULTS = ROOT / "results"
+SUMMARY = RESULTS / "summary"
+SUMMARY.mkdir(parents=True, exist_ok=True)
+
+def ece(confidences, correct, n_bins=10):
+    conf = np.array(confidences, dtype=float)
+    cor  = np.array(correct, dtype=float)
+    edges = np.linspace(0, 1, n_bins + 1)
+    e = 0.0
+    for i in range(n_bins):
+        if i == n_bins - 1:
+            m = (conf >= edges[i]) & (conf <= edges[i+1])
+        else:
+            m = (conf >= edges[i]) & (conf < edges[i+1])
+        if m.sum():
+            e += m.sum() / len(conf) * abs(cor[m].mean() - conf[m].mean())
+    return round(float(e), 4)
+
+# Load data — filler lives in master_e4_filler_cot.csv,
+# direct/CoT live in master_e1_e3_logit_calibration.csv
+filler_df = pd.read_csv(RESULTS / "master_e4_filler_cot.csv")
+base_df   = pd.read_csv(RESULTS / "master_e1_e3_logit_calibration.csv")
+
+# Standardise confidence to [0,1]
+# base_df already has verbalized_confidence in [0,1]
+# filler_df: check range
+print("Filler verbalized_confidence range:",
+      filler_df["verbalized_confidence"].min(),
+      "to",
+      filler_df["verbalized_confidence"].max())
+
+# Combine all three modes into one frame
+filler_df["mode"] = "filler"
+combined = pd.concat([
+    base_df[["model", "dataset", "mode", "question_idx",
+             "verbalized_confidence", "correct", "predicted"]],
+    filler_df[["model", "dataset", "mode", "question_idx",
+               "verbalized_confidence", "correct", "predicted"]],
+], ignore_index=True)
+
+print("\n" + "="*95)
+print("STEP 1: PARSE-FAILURE RATES PER (MODEL, MODE)")
+print("="*95)
+print(f"{'Model':15s} | {'Mode':8s} | {'Total':>6s} | {'Parsed Conf':>11s} | {'Parsed Ans':>10s} | {'Both Parsed':>12s} | {'Drop Rate':>10s}")
+print("-"*95)
+
+parse_sets = {}  # (model, mode) -> set of question_idx that parsed BOTH conf AND answer
+
+for (model, mode), grp in combined.groupby(["model", "mode"]):
+    total = len(grp)
+    has_conf = grp["verbalized_confidence"].notna()
+    has_ans  = grp["predicted"].notna() & (grp["predicted"].astype(str).str.strip() != "")
+    both     = has_conf & has_ans
+    n_conf   = has_conf.sum()
+    n_ans    = has_ans.sum()
+    n_both   = both.sum()
+    drop     = 1 - n_both / total
+
+    parse_sets[(model, mode)] = set(
+        grp.loc[both, "question_idx"].tolist()
+    )
+    print(f"{model:15s} | {mode:8s} | {total:6d} | {n_conf:11d} | {n_ans:10d} | {n_both:12d} | {drop*100:9.1f}%")
+
+print("\n" + "="*95)
+print("STEP 2: MATCHED-SUBSET CALIBRATION — same questions, all three modes")
+print("="*95)
+print(f"{'Model':15s} | {'Matched Qs':>10s} | {'Direct-only Qs':>15s} | {'Filler-only Qs':>15s} | {'ECE Direct':>10s} | {'ECE Filler':>10s} | {'ECE CoT':>10s} | {'Filler better?':>15s}")
+print("-"*95)
+
+results = []
+for model in combined["model"].unique():
+    modes_available = combined[combined["model"] == model]["mode"].unique()
+    if not all(m in modes_available for m in ["direct", "filler", "cot"]):
+        print(f"{model:15s} | Missing modes: {list(modes_available)}")
+        continue
+
+    d_set   = parse_sets.get((model, "direct"), set())
+    f_set   = parse_sets.get((model, "filler"), set())
+    c_set   = parse_sets.get((model, "cot"),    set())
+    matched = d_set & f_set & c_set
+
+    # Unmatched ECE (each mode on its own parsed questions)
+    def mode_ece(mode, q_set):
+        g = combined[(combined["model"] == model) & (combined["mode"] == mode) &
+                     (combined["question_idx"].isin(q_set))]
+        g = g.dropna(subset=["verbalized_confidence", "correct"])
+        if len(g) < 5:
+            return float("nan"), len(g)
+        return ece(g["verbalized_confidence"], g["correct"]), len(g)
+
+    ece_d_matched, n_d = mode_ece("direct", matched)
+    ece_f_matched, n_f = mode_ece("filler", matched)
+    ece_c_matched, n_c = mode_ece("cot",    matched)
+
+    # Also compute UNMATCHED (full set) for comparison
+    ece_d_full, nd_full = mode_ece("direct", d_set)
+    ece_f_full, nf_full = mode_ece("filler", f_set)
+
+    filler_better = "YES" if (not np.isnan(ece_f_matched) and
+                               not np.isnan(ece_d_matched) and
+                               ece_f_matched < ece_d_matched) else "NO"
+
+    print(f"{model:15s} | {len(matched):10d} | {len(d_set):15d} | {len(f_set):15d} | "
+          f"{ece_d_matched:10.4f} | {ece_f_matched:10.4f} | {ece_c_matched:10.4f} | {filler_better:>15s}")
+
+    results.append({
+        "model": model,
+        "matched_questions": len(matched),
+        "direct_parse_count": len(d_set),
+        "filler_parse_count": len(f_set),
+        "ece_direct_matched": ece_d_matched,
+        "ece_filler_matched": ece_f_matched,
+        "ece_cot_matched":    ece_c_matched,
+        "ece_direct_full":    ece_d_full,
+        "ece_filler_full":    ece_f_full,
+        "filler_beats_direct_matched": filler_better == "YES",
+    })
+
+print("\n" + "="*95)
+print("STEP 3: SURVIVORSHIP CHECK — does the gap change when restricted to matched set?")
+print("="*95)
+print(f"{'Model':15s} | {'Full-set Direct':>16s} | {'Full-set Filler':>16s} | {'Matched Direct':>15s} | {'Matched Filler':>15s} | {'Gap changed?':>13s}")
+print("-"*95)
+
+for r in results:
+    full_gap    = r["ece_direct_full"]    - r["ece_filler_full"]
+    matched_gap = r["ece_direct_matched"] - r["ece_filler_matched"]
+    changed = abs(full_gap - matched_gap) > 0.02
+    flag = "*** CHANGED" if changed else "stable"
+    print(f"{r['model']:15s} | {r['ece_direct_full']:16.4f} | {r['ece_filler_full']:16.4f} | "
+          f"{r['ece_direct_matched']:15.4f} | {r['ece_filler_matched']:15.4f} | {flag:>13s}")
+
+res_df = pd.DataFrame(results)
+res_df.to_csv(RESULTS / "matched_subset_calibration.csv", index=False)
+res_df.to_csv(SUMMARY / "matched_subset_calibration.csv", index=False)
+print("\nSaved to results/matched_subset_calibration.csv and results/summary/matched_subset_calibration.csv")

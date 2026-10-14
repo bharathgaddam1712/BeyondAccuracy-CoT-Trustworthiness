@@ -1,0 +1,224 @@
+"""
+E1 Analysis — Logit-Based vs Verbalized Calibration
+Phase 3: Run after overnight_gpu_run.py completes.
+
+Compares ECE computed from:
+  1. Verbalized confidence (model says "Confidence: 75")
+  2. Logit-derived confidence (mean top-1 token probability)
+
+Key finding:
+  If CoT improves verbalized ECE but NOT logit ECE at sub-3B
+    → Surface formatting effect (model learns to say "I'm 60% sure" better)
+  If CoT improves BOTH
+    → Genuine internal uncertainty reduction (deep mechanistic finding)
+
+Run: python e1_analysis.py
+"""
+
+import pandas as pd
+import numpy as np
+from pathlib import Path
+
+RESULTS = Path("results")
+FIGURES = Path("figures")
+FIGURES.mkdir(exist_ok=True)
+
+MODEL_SIZES = {
+    "Qwen2.5-0.5B": 0.5, "Llama-3.2-1B": 1.0, "Qwen2.5-1.5B": 1.5,
+    "Gemma-2-2B": 2.0, "Qwen2.5-3B": 3.0, "Llama-3.2-3B": 3.0,
+    "Llama-3.1-8B": 8.0,
+}
+
+
+def compute_ece(confidences, outcomes, n_bins=10):
+    """
+    ECE with equal-width bins over [0, 1].
+    Both inputs should already be in [0, 1].
+    """
+    confs = np.array(confidences, dtype=float)
+    outs = np.array(outcomes, dtype=float)
+    n = len(confs)
+    if n == 0:
+        return None
+
+    bin_edges = np.linspace(0, 1, n_bins + 1)
+    ece = 0.0
+    for i in range(n_bins):
+        if i < n_bins - 1:
+            mask = (confs >= bin_edges[i]) & (confs < bin_edges[i + 1])
+        else:
+            mask = (confs >= bin_edges[i]) & (confs <= bin_edges[i + 1])
+        if mask.sum() == 0:
+            continue
+        ece += (mask.sum() / n) * abs(outs[mask].mean() - confs[mask].mean())
+    return round(ece, 4)
+
+
+def main():
+    csv_path = RESULTS / "e1_e3_logit_calibration.csv"
+    if not csv_path.exists():
+        print(f"ERROR: {csv_path} not found. Run overnight_gpu_run.py first.")
+        return
+
+    df = pd.read_csv(csv_path)
+    print(f"Loaded {len(df)} rows from {csv_path.name}")
+    print(f"Columns: {list(df.columns)}")
+    print(f"Models: {df['model'].unique().tolist()}")
+    print(f"Modes: {df['mode'].unique().tolist()}")
+
+    # --- Compute ECE from both signals ---
+    # verbalized_confidence: already [0, 1] from parse_confidence()
+    # logit_confidence: mean top-1 prob, already [0, 1]
+
+    print("\n" + "=" * 85)
+    print("E1: LOGIT-BASED vs VERBALIZED ECE")
+    print("  Verb = model says 'Confidence: X'")
+    print("  Logit = mean top-1 token probability during generation")
+    print("=" * 85 + "\n")
+
+    header = f"{'Model':20s} | {'Size':>5s} | {'Mode':6s} | {'Verb ECE':>8s} | {'Logit ECE':>9s} | {'Δ(L-V)':>7s} | {'n_verb':>6s} | {'n_logit':>7s}"
+    print(header)
+    print("-" * len(header))
+
+    ece_rows = []
+    for (model, mode), g in df.groupby(["model", "mode"]):
+        # Verbalized ECE
+        valid_verb = g.dropna(subset=["verbalized_confidence", "correct"])
+        ece_verb = compute_ece(valid_verb["verbalized_confidence"], valid_verb["correct"]) if len(valid_verb) > 10 else None
+
+        # Logit ECE
+        valid_logit = g.dropna(subset=["logit_confidence", "correct"])
+        ece_logit = compute_ece(valid_logit["logit_confidence"], valid_logit["correct"]) if len(valid_logit) > 10 else None
+
+        size = MODEL_SIZES.get(model, 0)
+        v_str = f"{ece_verb:.4f}" if ece_verb is not None else "  N/A"
+        l_str = f"{ece_logit:.4f}" if ece_logit is not None else "   N/A"
+        d_str = f"{ece_logit - ece_verb:+.4f}" if (ece_verb is not None and ece_logit is not None) else "   N/A"
+
+        print(f"{model:20s} | {size:5.1f} | {mode:6s} | {v_str:>8s} | {l_str:>9s} | {d_str:>7s} | {len(valid_verb):>6d} | {len(valid_logit):>7d}")
+
+        ece_rows.append({
+            "model": model, "mode": mode, "size_b": size,
+            "ece_verbalized": ece_verb, "ece_logit": ece_logit,
+            "n_verb": len(valid_verb), "n_logit": len(valid_logit),
+        })
+
+    ece_df = pd.DataFrame(ece_rows)
+
+    # --- Compute CoT effect on both ECE types ---
+    print("\n" + "=" * 85)
+    print("CoT EFFECT: Does CoT improve calibration via verbalized AND logit signals?")
+    print("  Δ_ECE = ECE(cot) - ECE(direct). Negative = CoT helped.")
+    print("=" * 85 + "\n")
+
+    delta_rows = []
+    for model in ece_df["model"].unique():
+        direct = ece_df[(ece_df["model"] == model) & (ece_df["mode"] == "direct")]
+        cot = ece_df[(ece_df["model"] == model) & (ece_df["mode"] == "cot")]
+        if direct.empty or cot.empty:
+            continue
+
+        d, c = direct.iloc[0], cot.iloc[0]
+        size = MODEL_SIZES.get(model, 0)
+        scale = "sub-3B" if size < 3 else "≥3B"
+
+        verb_delta = None
+        logit_delta = None
+
+        if d["ece_verbalized"] is not None and c["ece_verbalized"] is not None:
+            verb_delta = c["ece_verbalized"] - d["ece_verbalized"]
+        if d["ece_logit"] is not None and c["ece_logit"] is not None:
+            logit_delta = c["ece_logit"] - d["ece_logit"]
+
+        verb_str = f"{verb_delta:+.4f}" if verb_delta is not None else "  N/A"
+        logit_str = f"{logit_delta:+.4f}" if logit_delta is not None else "  N/A"
+
+        # Interpretation
+        if verb_delta is not None and logit_delta is not None:
+            if verb_delta < -0.01 and logit_delta < -0.01:
+                interp = "BOTH improve → genuine uncertainty reduction"
+            elif verb_delta < -0.01 and logit_delta >= -0.01:
+                interp = "Only VERBALIZED improves → formatting effect"
+            elif verb_delta >= -0.01 and logit_delta < -0.01:
+                interp = "Only LOGIT improves → internal change, poor verbalization"
+            else:
+                interp = "Neither improves"
+        else:
+            interp = "Insufficient data"
+
+        print(f"{model} ({size}B, {scale}):")
+        print(f"  Verb ECE Δ: {verb_str}  |  Logit ECE Δ: {logit_str}")
+        print(f"  → {interp}")
+        print()
+
+        delta_rows.append({
+            "model": model, "size_b": size, "scale": scale,
+            "verb_ece_delta": verb_delta, "logit_ece_delta": logit_delta,
+            "interpretation": interp,
+        })
+
+    # --- Save ---
+    ece_df.to_csv(RESULTS / "e1_ece_comparison.csv", index=False)
+    if delta_rows:
+        delta_df = pd.DataFrame(delta_rows)
+        delta_df.to_csv(RESULTS / "e1_ece_deltas.csv", index=False)
+
+        # Summary
+        print("=" * 85)
+        print("SUMMARY BY SCALE GROUP")
+        print("=" * 85 + "\n")
+        for scale in ["sub-3B", "≥3B"]:
+            sg = delta_df[delta_df["scale"] == scale]
+            if sg.empty:
+                continue
+            print(f"  {scale} models (n={len(sg)}):")
+            verb_valid = sg["verb_ece_delta"].dropna()
+            logit_valid = sg["logit_ece_delta"].dropna()
+            if len(verb_valid) > 0:
+                print(f"    Avg Verbalized ECE Δ: {verb_valid.mean():+.4f}")
+            if len(logit_valid) > 0:
+                print(f"    Avg Logit ECE Δ:      {logit_valid.mean():+.4f}")
+            print()
+
+    # --- Try to generate plot ---
+    try:
+        import matplotlib.pyplot as plt
+
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+        for ax, ece_col, title in [
+            (axes[0], "ece_verbalized", "Verbalized Confidence ECE"),
+            (axes[1], "ece_logit", "Logit-Based (Top-1 Prob) ECE"),
+        ]:
+            for mode, marker, color in [("direct", "o", "steelblue"), ("cot", "s", "coral")]:
+                subset = ece_df[ece_df["mode"] == mode].dropna(subset=[ece_col])
+                if subset.empty:
+                    continue
+                ax.scatter(subset["size_b"], subset[ece_col],
+                          marker=marker, color=color, s=80, label=mode, zorder=5)
+                # Connect with line
+                sorted_s = subset.sort_values("size_b")
+                ax.plot(sorted_s["size_b"], sorted_s[ece_col],
+                       color=color, alpha=0.5, linewidth=1)
+
+            ax.set_xlabel("Model Size (B params)")
+            ax.set_ylabel("ECE (lower = better)")
+            ax.set_title(title)
+            ax.legend()
+            ax.axvline(x=3.0, color="gray", linestyle="--", alpha=0.5, label="3B threshold")
+            ax.set_xscale("log")
+
+        plt.tight_layout()
+        fig_path = FIGURES / "e1_logit_vs_verbalized_ece.png"
+        plt.savefig(fig_path, dpi=150, bbox_inches="tight")
+        print(f"Saved figure: {fig_path}")
+        plt.close()
+    except ImportError:
+        print("(matplotlib not available — skipping plot)")
+
+    print(f"\nSaved: {RESULTS / 'e1_ece_comparison.csv'}")
+    print(f"Saved: {RESULTS / 'e1_ece_deltas.csv'}")
+
+
+if __name__ == "__main__":
+    main()
